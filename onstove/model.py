@@ -2838,7 +2838,7 @@ class OnStove(DataProcessor):
         if isinstance(self.gdf[variable].iloc[0], str):
             if isinstance(labels, dict):
                 dff = self._re_name(dff, labels, variable)
-            dff[variable] += ' {} '.format(self.tech_separator)
+            dff[variable] = dff[variable].astype(str) + ' {} '.format(self.tech_separator)
             dff = dff.groupby('index').agg({variable: 'sum', 'geometry': 'first'})
             dff[variable] = [s[0:len(s) - (len(self.tech_separator) + 2)] for s in dff[variable]]
             if isinstance(labels, dict):
@@ -4182,12 +4182,24 @@ class OnStove(DataProcessor):
         category_color_map = dict(zip(categories, colors))
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+		
+        cmap2 = {cat: color for cat, color in zip(categories, colors)}
+		
+        self.plot(variable, cmap=cmap2, ax=ax,
+           figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
+           legend_position=(-0.25, 1.05),
+           legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
+           stats=False, #stats_kwargs={'stats_position': (0.1, 0.15)},
+           rasterized=True, dpi=300,
+           # scale_bar=scale_bar_prop,
+           # north_arrow=north_arrow_prop,
+           )
         
-        self.gdf.plot(column=variable, legend=True, cmap=cmap, ax=ax, markersize=0.1)
-        ax.legend(handles=patches, title="Cost/Income ratio", 
-                  loc='upper left', bbox_to_anchor=(-0.25, 1.05), fontsize=9, title_fontsize=10)
-        ax.set_title(title, fontsize=12)
-        ax.axis('off')
+        # self.gdf.plot(column=variable, legend=True, cmap=cmap, ax=ax, markersize=0.1, rasterized=True)
+        # ax.legend(handles=patches, title="Cost/Income ratio", 
+                  # loc='upper left', bbox_to_anchor=(-0.25, 1.05), fontsize=9, title_fontsize=10)
+        # ax.set_title(title, fontsize=12)
+        # ax.axis('off')
 
         counts = self.gdf.groupby(variable)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
         counts = counts.reindex(categories).fillna(0)
