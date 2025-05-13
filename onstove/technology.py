@@ -715,6 +715,8 @@ class Technology:
                 model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / model.gdf['income']
             else:
                 model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / model.gdf['absolute_wealth']
+            
+            model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['cost_income_ratio_{}'.format(self.name)].clip(lower=0)
         
             bins = [0.0]
             for cat in categories:
