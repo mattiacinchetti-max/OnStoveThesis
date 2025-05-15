@@ -666,7 +666,7 @@ class Technology:
         self.time_value = self.total_time_saved * model.gdf["value_of_time"] / (
                 1 + model.specs["discount_rate"]) ** (proj_life)
 
-    def total_costs(self):
+    def total_costs(self, w_salvage=1):
         """ Calculates total costs (fuel, investment, operation and maintenance as well as salvage costs). Function does
         not return anything but saves the total costs in the `costs` attribute of the OnStove model object.
 
@@ -681,7 +681,7 @@ class Technology:
         discount_fuel_cost, discounted_om, salvage, discounted_inv
         """
         self.costs = (self.discounted_fuel_cost + self.discounted_investments +
-                      self.discounted_om_costs - self.discounted_salvage_cost)
+                      self.discounted_om_costs - w_salvage * self.discounted_salvage_cost)
         
     def affordability_categories(self, model: 'onstove.OnStove', categories: list = ['<5%', '5-15%', '15%+']):
         """Assigns the affordability categories for each stove. The affordability categories are based on the
@@ -750,7 +750,7 @@ class Technology:
 
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method combines all costs and benefits as specified by the user using the weights parameters. Function
         does not return anything but saves the total benefits in the `benefits` attribute of the OnStove object and the
         net-benefits in the `net-benefits` attribute of the OnStove net-benefits object.
@@ -781,7 +781,7 @@ class Technology:
          time_saved
          carbon_emissions
         """
-        self.total_costs()
+        self.total_costs(w_salvage=w_salvage)
         self.benefits = w_health * (self.distributed_morbidity + self.distributed_mortality) + \
                         w_spillovers * (self.distributed_spillovers_morb + self.distributed_spillovers_mort) + \
                         w_environment * self.decreased_carbon_costs + w_time * self.time_value
@@ -1131,7 +1131,7 @@ class LPG(Technology):
             self.discounted_investments += (self.discounted_infra_cost * (1 - self.pop_sqkm))
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account access to roads (proximity).
 
         Parameters
@@ -1156,7 +1156,7 @@ class LPG(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         if isinstance(self.roads, VectorLayer):
             dist_roads = self.roads.proximity(base_layer=model.base_layer, create_raster=False)
             dist_roads.data = dist_roads.data > self.distance_limit
@@ -1816,7 +1816,7 @@ class Electricity(Technology):
             self.discounted_investments += (self.connection_cost + self.capacity_cost * (1 - self.pop_sqkm))
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account electricity availability
         in the calculations.
 
@@ -1842,7 +1842,7 @@ class Electricity(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         model.gdf.loc[model.gdf['Current_elec'] == 0, "net_benefit_{}".format(self.name)] = np.nan
         self.net_benefits.loc[model.gdf['Current_elec'] == 0] = np.nan
         factor = model.gdf['Elec_pop_calib'] / model.gdf['Calibrated_pop']
@@ -2061,7 +2061,7 @@ class MiniGrids(Electricity):
         self.discounted_investments += self.connection_cost
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
 
         """This method modifies :meth:`Electricity.net_benefit` for the mini-grid class
 
@@ -2087,7 +2087,7 @@ class MiniGrids(Electricity):
         --------
         net_benefit
         """
-        super(Electricity, self).net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super(Electricity, self).net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         self.calculate_potential(model)
         self.households = self.gdf['supported_hh']
         model.gdf.loc[self.households == 0, "net_benefit_{}".format(self.name)] = np.nan
@@ -2363,7 +2363,7 @@ class Biogas(Technology):
         self.total_time_yr += (self.manure_feed_time * 365)
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account biogas availability
         in the calculations.
 
@@ -2389,7 +2389,7 @@ class Biogas(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         required_energy_hh = self.required_energy_hh(model)
         model.gdf.loc[(model.gdf['biogas_energy'] < required_energy_hh), "benefits_{}".format(self.name)] = np.nan
         model.gdf.loc[(model.gdf['biogas_energy'] < required_energy_hh), "net_benefit_{}".format(self.name)] = np.nan

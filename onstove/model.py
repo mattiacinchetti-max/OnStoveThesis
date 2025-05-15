@@ -1223,6 +1223,7 @@ class OnStove(DataProcessor):
             'discountrate': 'discount_rate',
             'healthspilloversparameter': 'health_spillovers_parameter',
             'wcosts': 'w_costs',
+            'wsalvage': 'w_salvage',
             'wenvironment': 'w_environment',
             'whealth': 'w_health',
             'wspillovers': 'w_spillovers',
@@ -2141,7 +2142,8 @@ class OnStove(DataProcessor):
             tech.salvage(self)
             print(f'Calculating net benefit for {tech.name}...\n')
             tech.net_benefit(self, self.specs['w_health'], self.specs['w_spillovers'],
-                             self.specs['w_environment'], self.specs['w_time'], self.specs['w_costs'])
+                             self.specs['w_environment'], self.specs['w_time'], self.specs['w_costs'],
+                             self.specs['w_salvage'])
             tech.affordability_categories(self, categories=affordability_categories)
 
         print('Getting maximum net benefit technologies...')
