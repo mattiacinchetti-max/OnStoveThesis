@@ -2186,7 +2186,7 @@ class OnStove(DataProcessor):
         columns_dict['max_benefit_tech'] = 'first'
         return columns_dict
 
-    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True):
+    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True, partial_access = True):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell.
 
         It saves the technology with highest net-benefit in the ``max_benefi_tech`` column of the :attr:`gdf`
@@ -2230,62 +2230,63 @@ class OnStove(DataProcessor):
         self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
         self.gdf["maximum_net_benefit"] = self.gdf[temps].max(axis=1)
 
-        gdf = gpd.GeoDataFrame()
-        gdf_copy = self.gdf.copy()
-        # TODO: Change this to a while loop that checks the sum of number of households supplied against the total hhs
-        for tech in techs:
-            current = (tech.households < gdf_copy['Households']) & \
-                      (gdf_copy["max_benefit_tech"] == tech.name)
-            dff = gdf_copy.loc[current].copy()
-            if current.sum() > 0:
-                # dff.loc[current, "maximum_net_benefit"] *= tech.factor.loc[current]
-                dff.loc[current, f'net_benefit_{tech.name}_temp'] = np.nan
+        if partial_access:
+            gdf = gpd.GeoDataFrame()
+            gdf_copy = self.gdf.copy()
+            # TODO: Change this to a while loop that checks the sum of number of households supplied against the total hhs
+            for tech in techs:
+                current = (tech.households < gdf_copy['Households']) & \
+                          (gdf_copy["max_benefit_tech"] == tech.name)
+                dff = gdf_copy.loc[current].copy()
+                if current.sum() > 0:
+                    # dff.loc[current, "maximum_net_benefit"] *= tech.factor.loc[current]
+                    dff.loc[current, f'net_benefit_{tech.name}_temp'] = np.nan
 
-                second_benefit_cols = temps.copy()
-                second_benefit_cols.remove(f'net_benefit_{tech.name}_temp')
-                second_best = dff.loc[current, second_benefit_cols].idxmax(axis=1)
+                    second_benefit_cols = temps.copy()
+                    second_benefit_cols.remove(f'net_benefit_{tech.name}_temp')
+                    second_best = dff.loc[current, second_benefit_cols].idxmax(axis=1)
 
-                second_best.replace(np.nan, 'NaN', inplace=True)
-                second_best = second_best.str.replace("net_benefit_", "")
-                second_best = second_best.str.replace("_temp", "")
-                second_best.replace('NaN', np.nan, inplace=True)
+                    second_best.replace(np.nan, 'NaN', inplace=True)
+                    second_best = second_best.str.replace("net_benefit_", "")
+                    second_best = second_best.str.replace("_temp", "")
+                    second_best.replace('NaN', np.nan, inplace=True)
 
-                second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1) #* (1 - tech.factor.loc[current])
+                    second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1) #* (1 - tech.factor.loc[current])
 
-                elec_factor = dff['Elec_pop_calib'] / dff['Calibrated_pop']
-                dff['max_benefit_tech'] = second_best
-                dff['maximum_net_benefit'] = second_tech_net_benefit
-                dff['Calibrated_pop'] *= (1 - tech.factor.loc[current])
-                dff['Households'] *= (1 - tech.factor.loc[current])
+                    elec_factor = dff['Elec_pop_calib'] / dff['Calibrated_pop']
+                    dff['max_benefit_tech'] = second_best
+                    dff['maximum_net_benefit'] = second_tech_net_benefit
+                    dff['Calibrated_pop'] *= (1 - tech.factor.loc[current])
+                    dff['Households'] *= (1 - tech.factor.loc[current])
 
-                self.gdf.loc[current, 'Calibrated_pop'] *= tech.factor.loc[current]
-                self.gdf.loc[current, 'Households'] *= tech.factor.loc[current]
-                if tech.name == 'Electricity':
-                    dff['Elec_pop_calib'] *= 0
-                #     self.gdf.loc[current, 'Elec_pop_calib'] *= tech.factor.loc[current]
-                else:
-                    self.gdf.loc[current, 'Elec_pop_calib'] = self.gdf.loc[current, 'Calibrated_pop'] * elec_factor
-                    dff['Elec_pop_calib'] = dff['Calibrated_pop'] * elec_factor
-                gdf = pd.concat([gdf, dff])
+                    self.gdf.loc[current, 'Calibrated_pop'] *= tech.factor.loc[current]
+                    self.gdf.loc[current, 'Households'] *= tech.factor.loc[current]
+                    if tech.name == 'Electricity':
+                        dff['Elec_pop_calib'] *= 0
+                    #     self.gdf.loc[current, 'Elec_pop_calib'] *= tech.factor.loc[current]
+                    else:
+                        self.gdf.loc[current, 'Elec_pop_calib'] = self.gdf.loc[current, 'Calibrated_pop'] * elec_factor
+                        dff['Elec_pop_calib'] = dff['Calibrated_pop'] * elec_factor
+                    gdf = pd.concat([gdf, dff])
 
-        self.gdf = pd.concat([self.gdf, gdf])
+            self.gdf = pd.concat([self.gdf, gdf])
 
-        for net in net_benefit_cols:
-            self.gdf[net + '_temp'] = self.gdf[net]
+            for net in net_benefit_cols:
+                self.gdf[net + '_temp'] = self.gdf[net]
 
-        temps = [col for col in self.gdf if 'temp' in col]
+            temps = [col for col in self.gdf if 'temp' in col]
 
-        for tech in self.gdf["max_benefit_tech"].unique():
-            index = self.gdf.loc[self.gdf['max_benefit_tech'] == tech].index
-            self.gdf.loc[index, f'net_benefit_{tech}_temp'] = np.nan
+            for tech in self.gdf["max_benefit_tech"].unique():
+                index = self.gdf.loc[self.gdf['max_benefit_tech'] == tech].index
+                self.gdf.loc[index, f'net_benefit_{tech}_temp'] = np.nan
 
-        isna = self.gdf["max_benefit_tech"].isna()
+            isna = self.gdf["max_benefit_tech"].isna()
 
-        if isna.sum() > 0:
-            self.gdf.loc[isna, 'max_benefit_tech'] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
-        self.gdf.loc[isna, "maximum_net_benefit"] = self.gdf.loc[isna, temps].max(axis=1)
+            if isna.sum() > 0:
+                self.gdf.loc[isna, 'max_benefit_tech'] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
+            self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
+            self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
+            self.gdf.loc[isna, "maximum_net_benefit"] = self.gdf.loc[isna, temps].max(axis=1)
 
     # TODO: check if we need this method
 
