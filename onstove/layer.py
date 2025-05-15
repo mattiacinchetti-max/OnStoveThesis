@@ -1415,7 +1415,7 @@ class RasterLayer(_Layer):
         elif type == 'gpkg':
             self.meta.update(driver='GPKG')
             with rasterio.open(output_file, "w", raster_table = self.name, APPEND_SUBDATASET = append_subdataset,
-                               **self.meta) as dest:
+                               count=1, **self.meta) as dest:
                 dest.write(self.data, 1)
 
     def align(self, base_layer: Union['RasterLayer', str],

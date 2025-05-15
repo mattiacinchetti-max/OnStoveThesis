@@ -2910,7 +2910,7 @@ class OnStove(DataProcessor):
 
         return raster, codes, cmap
 
-    def to_gpkg(self, name:str, variable: str,
+    def to_gpkg(self, name: Union[str,dict[str, str]], variable: str,
                labels: Optional[dict[str, str]] = None,
                cmap: Optional[dict[str, str]] = None,
                metric: str = 'mean', scaling_factor: int = 1,
@@ -2941,12 +2941,18 @@ class OnStove(DataProcessor):
         nodata: float or int
             Defines nodata values to be ignored by the function.
         """
-        raster, codes, cmap = self.create_layer(variable, labels=labels, cmap=cmap, metric=metric, nodata=nodata,
+        if isinstance(variable, dict):
+            var_name = variable.keys()[0]
+            save_name = variable.values()[0]
+        else:
+            var_name = variable
+            save_name = variable
+        raster, codes, cmap = self.create_layer(var_name, labels=labels, cmap=cmap, metric=metric, nodata=nodata,
                                                 scaling_factor=scaling_factor)
         if mask:
             raster.meta['nodata'] = mask_nodata
             raster.mask(self.mask_layer)
-        raster.save(os.path.join(self.output_directory), name=name, type='gpkg', append_subdataset=append_subdataset)
+        raster.save(os.path.join(self.output_directory), name=save_name, type='gpkg', append_subdataset=append_subdataset)
         if codes and cmap:
             with open(os.path.join(self.output_directory, f'{variable}ColorMap.clr'), 'w') as f:
                 for label, code in codes.items():
