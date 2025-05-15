@@ -2047,7 +2047,8 @@ class OnStove(DataProcessor):
         self.gdf['value_of_time'] = norm_layer * self.specs[
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
-    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, affordability_categories: list = ['<5%', '5-15%', '15%+'], metric: str = 'net_benefit'):
+    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, 
+            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit'):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
         It loops through the ``technologies`` and calculates all costs, benefit and the net-benefit of cooking with
@@ -2079,8 +2080,8 @@ class OnStove(DataProcessor):
             for that threshold, and last threshold with a + sign.
             Example: '['<5%', '5-15%', '15-25%', '25%+']'
 
-        metric: str, default 'net_benefit'
-            Metric to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
+        target: str, default 'net_benefit'
+            Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
             'cost_income_ratio'.
 
         See also
@@ -2147,10 +2148,10 @@ class OnStove(DataProcessor):
         if isinstance(technologies, list):
             self.maximum_net_benefit(techs, restriction=restriction)
         elif isinstance(technologies, dict):
-            self.stove_share_assignment(technologies, restriction=restriction, metric=metric)
-        if metric == 'net_benefit':
+            self.stove_share_assignment(technologies, restriction=restriction, target=target)
+        if target == 'net_benefit':
             column = 'max_benefit_tech'
-        elif metric == 'cost_income_ratio':
+        elif target == 'cost_income_ratio':
             column = 'most_affordable_tech'
         print('Extracting indicators...')
         print('    - Lives saved')
@@ -2286,7 +2287,7 @@ class OnStove(DataProcessor):
 
     # TODO: check if we need this method
 
-    def stove_share_assignment(self, techs: dict[str:dict[str:float]], metric: str = 'net_benefit', restriction: bool = True):
+    def stove_share_assignment(self, techs: dict[str:dict[str:float]], target: str = 'net_benefit', restriction: bool = True):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell
         while achieving user defined shares.
 
@@ -2297,8 +2298,8 @@ class OnStove(DataProcessor):
         ----------
         techs: dict of str:float
             Dictionary with technology names as keys and their user defined share as values.
-        metric: str, default 'net_benefit'
-            Metric to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
+        target: str, default 'net_benefit'
+            Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
             'cost_income_ratio'.
         restriction: bool, default True
             Whether to have the restriction of only selecting technologies producing a positive benefit compared to the
@@ -2319,7 +2320,7 @@ class OnStove(DataProcessor):
         extract_salvage
 
         """
-        if metric == 'net_benefit':
+        if target == 'net_benefit':
             net_benefit_cols = [col for col in self.gdf if 'net_benefit_' in col]
             benefits_cols = [col for col in self.gdf if 'benefits_' in col]
 
@@ -2330,7 +2331,7 @@ class OnStove(DataProcessor):
             result_tech = 'max_benefit_tech'
             result_value = 'maximum_net_benefit'
 
-        elif metric == 'cost_income_ratio':
+        elif target == 'cost_income_ratio':
             result_tech = 'most_affordable_tech'
             result_value = 'most_affordable_cost_income_ratio'
 
@@ -2353,9 +2354,9 @@ class OnStove(DataProcessor):
 
             i = 1
             while len(tech_target_pop_unassigned) > 0:
-                cols = [f'{metric}_{tech}' for tech in tech_target_pop_unassigned]
+                cols = [f'{target}_{tech}' for tech in tech_target_pop_unassigned]
                 for tech, pop_unassigned in tech_target_pop_unassigned.items():
-                    print(f'Assigning {tech} with target population: ', f"{pop_unassigned:.2f}", f'Attempt as #{i} best technology for the metric {metric}.')
+                    print(f'Assigning {tech} with target population: ', f"{pop_unassigned:.2f}", f'Attempt as #{i} best technology for the target {target}.')
                     target_pop_assign = pop_unassigned
 
                     condition = self.gdf.loc[isurban, result_tech].isna()
@@ -2364,30 +2365,30 @@ class OnStove(DataProcessor):
                         tech_target_pop_unassigned[tech] = -999
                         print('No available cells to assign, since this the last technology to be assigned, i.e. worst technology.\n')
                         continue
-                    if metric == 'net_benefit':
+                    if target == 'net_benefit':
                         available_cells[result_tech] = available_cells[cols].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
-                    elif metric == 'cost_income_ratio':
+                    elif target == 'cost_income_ratio':
                         available_cells[result_tech] = available_cells[cols].idxmin(axis=1).astype('string')
-                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{metric}_", "")
-                    if metric == 'net_benefit':
+                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+                    if target == 'net_benefit':
                         available_cells[result_value] = available_cells[cols].max(axis=1) # Gets the maximum net benefit for the available cells.
-                    elif metric == 'cost_income_ratio':
+                    elif target == 'cost_income_ratio':
                         available_cells[result_value] = available_cells[cols].min(axis=1)
 
                     condition = (available_cells[result_tech] == tech)
                     candidates = available_cells.loc[condition]
                     if len(candidates) == 0:
-                        if available_cells[f'{metric}_{tech}'].isna().all():
+                        if available_cells[f'{target}_{tech}'].isna().all():
                             tech_target_pop_unassigned[tech] = -999
                             print('No candidates to assign, since remaining cells are unavailable for this technology.\n')
                             continue
                         else:
                             print(f'No candidates to assign as #{i} best option.\n')
                             continue
-                    if metric == 'net_benefit':
+                    if target == 'net_benefit':
                         candidates = candidates.sort_values(result_value, ascending=False)
-                    elif metric == 'cost_income_ratio':
-                        candidates = candidates.sort_values(result_value, ascending=True)
+                    elif target == 'cost_income_ratio':
+                        candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
                     candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
 
                     assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
@@ -3048,7 +3049,7 @@ class OnStove(DataProcessor):
                 for value, key in codes.items():
                     writer.writerow({'KEY': key, 'VALUE': f'{key}: {value}'})
 
-    def plot(self, variable: str, variable_value: str = 'maximum_net_benefit', metric='mean',
+    def plot(self, variable: str = 'max_benefit_tech', metric='mean',
              labels: Optional[dict[str, str]] = None,
              cmap: Union[dict[str, str], str] = 'viridis',
              cumulative_count: Optional[tuple[float, float]] = None,
@@ -3273,7 +3274,7 @@ class OnStove(DataProcessor):
             fig, ax = plt.subplots(1, 1, figsize=figsize)
 
         if stats:
-            self._add_statistics(ax, variable=variable, variable_value=variable_value, kwargs=stats_kwargs)
+            self._add_statistics(ax, variable=variable, kwargs=stats_kwargs)
 
         ax = raster.plot(cmap=cmap, cumulative_count=cumulative_count,
                          quantiles=quantiles,
@@ -3297,7 +3298,7 @@ class OnStove(DataProcessor):
 
         return ax
 
-    def _add_statistics(self, ax, variable='max_benefit_tech', variable_value: str = 'maximum_net_benefit', kwargs: Optional[dict] = None):
+    def _add_statistics(self, ax, variable: str ='max_benefit_tech', kwargs: Optional[dict] = None):
         _kwargs = {'extra_stats': None, 'stats_position': (1.02, 0.9), 'pad': 0, 'sep': 6,
                    'fontsize': 10, 'fontcolor': 'black', 'fontweight': 'normal',
                    'box_props': dict(boxstyle='round', facecolor='#f1f1f1ff', edgecolor='lightgray')}
@@ -3313,7 +3314,7 @@ class OnStove(DataProcessor):
                 extra_text.append(TextArea(name, textprops=font_props))
                 extra_values.append(TextArea(stat, textprops=font_props))
                 
-        summary = self.summary(total=True, pretty=False, variable=variable, variable_value=variable_value, remove_none=True)
+        summary = self.summary(total=True, pretty=False, variable=variable, remove_none=True)
         deaths = TextArea("Deaths avoided", textprops=font_props)
         health = TextArea("Health costs avoided", textprops=font_props)
         emissions = TextArea("Emissions avoided", textprops=font_props)
@@ -3500,7 +3501,7 @@ class OnStove(DataProcessor):
                           scale_bar=scale_bar, north_arrow=north_arrow, legend_prop=legend_prop)
 
     def summary(self, total: bool = True, pretty: bool = True, labels: Optional[dict] = None,
-                variable: str = 'max_benefit_tech', variable_value: str = 'maximum_net_benefit', remove_none: bool = False) -> pd.DataFrame:
+                variable: str = 'max_benefit_tech', remove_none: bool = False) -> pd.DataFrame:
         """Creates a summary of the results grouped by the selected categorical `variable`.
 
         The method uses the categorical `variable` provided to group selected results of the :attr:`gdf` dataframe. It
@@ -3542,8 +3543,10 @@ class OnStove(DataProcessor):
         """
         if variable == 'max_benefit_tech':
             label = 'Max benefit technology'
+            variable_value = 'maximum_net_benefit'
         elif variable == 'most_affordable_tech':
             label = 'Most affordable technology'
+            variable_value = 'most_affordable_cost_income_ratio'
         dff = self.gdf.copy()
         if labels is not None:
             dff = self._re_name(dff, labels, variable)
@@ -4255,7 +4258,7 @@ class OnStove(DataProcessor):
         return p
 
     def plot_affordability(self, variable: str, labels: Optional[dict[str, str]] = None,
-                           cmap: Optional[dict[str, str]] = 'viridis', title: Optional[str] = None,
+                           cmap: Optional[dict[str, str]] = 'viridis', legend_title: Optional[str] = None,
                            ax: Optional['matplotlib.axes.Axes'] = None,
                            bar_variable: str = 'Households',
                            categories: list = ['<5%', '5-10%', '10-15%', '15-20%', '20-25%', '25-30%', '30%+'],
