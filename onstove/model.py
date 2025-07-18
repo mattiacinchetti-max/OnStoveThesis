@@ -2144,7 +2144,8 @@ class OnStove(DataProcessor):
             tech.net_benefit(self, self.specs['w_health'], self.specs['w_spillovers'],
                              self.specs['w_environment'], self.specs['w_time'], self.specs['w_costs'],
                              self.specs['w_salvage'])
-            tech.affordability_categories(self, categories=affordability_categories)
+            if 'absolute_wealth' in self.gdf.columns or 'income' in self.gdf.columns:
+                tech.affordability_categories(self, categories=affordability_categories)
 
         print('Getting maximum net benefit technologies...')
         if isinstance(technologies, list):
