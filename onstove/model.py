@@ -2291,7 +2291,8 @@ class OnStove(DataProcessor):
 
     # TODO: check if we need this method
 
-    def stove_share_assignment(self, techs: dict[str:dict[str:float]], target: str = 'net_benefit', restriction: bool = True):
+    def stove_share_assignment(self, techs: dict[str:dict[str:float]], target: str = 'net_benefit', 
+                               restriction: bool = True, prioritize: bool = True):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell
         while achieving user defined shares.
 
@@ -2340,7 +2341,6 @@ class OnStove(DataProcessor):
             result_value = 'most_affordable_cost_income_ratio'
 
         for region, shares in techs.items():
-            print(f'Prioritizing technology shares in {region} areas.\n')
             if region == 'Urban':
                 isurban = self.gdf['IsUrban'] > 20
             else:
@@ -2355,6 +2355,122 @@ class OnStove(DataProcessor):
             self.gdf.loc[isurban, result_tech] = None
             self.gdf.loc[isurban, result_value] = None
             self.gdf.loc[isurban, 'technology_option'] = None
+
+            if prioritize:
+                print(f'Prioritizing technology shares in {region} areas.\n')
+                if region == 'Urban':
+                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[0]))
+                elif region == 'Rural':
+                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[0], reverse=True))    
+                for tech, pop_unassigned in tech_target_pop_unassigned.items():
+                    if tech == 'Electricity':
+                        print(f'Prioritizing Electricity.\n')
+                        col = [f'{target}_{tech}']
+                        target_pop_assign = pop_unassigned
+
+                        condition = self.gdf.loc[isurban, result_tech].isna()
+                        available_cells = self.gdf.loc[condition & isurban].copy() # Selects the cells that are available to be assigned a technology.
+                        if len(available_cells) == 0:
+                            tech_target_pop_unassigned[tech] = -999
+                            print('No available cells to assign, since this the last technology to be assigned, i.e. worst technology.\n')
+                            continue
+                        if target == 'net_benefit':
+                            available_cells[result_tech] = available_cells[col].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
+                        elif target == 'cost_income_ratio':
+                            available_cells[result_tech] = available_cells[col].idxmin(axis=1).astype('string')
+                        available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+                        if target == 'net_benefit':
+                            available_cells[result_value] = available_cells[col].max(axis=1) # Gets the maximum net benefit for the available cells.
+                        elif target == 'cost_income_ratio':
+                            available_cells[result_value] = available_cells[col].min(axis=1)
+
+                        condition = (available_cells[result_tech] == tech)
+                        candidates = available_cells.loc[condition]
+                        if len(candidates) == 0:
+                            if available_cells[f'{target}_{tech}'].isna().all():
+                                tech_target_pop_unassigned[tech] = -999
+                                print('No candidates to assign, since remaining cells are unavailable for this technology.\n')
+                                continue
+                            else:
+                                print(f'No candidates to assign as #{i} best option.\n')
+                                continue
+                        if target == 'net_benefit':
+                            candidates = candidates.sort_values(result_value, ascending=False)
+                        elif target == 'cost_income_ratio':
+                            candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
+                        candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                        assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
+                        if candidates['Calibrated_pop'].sum() > target_pop_assign:
+                            len_assigned = [len(assigned)]
+                            assigned = pd.concat([assigned, candidates.iloc[len_assigned]])
+                            print('Share completed assigned plus one cell.')
+                        assigned_ids = assigned.index.to_list() # Gets the ids of the assigned candidates.
+                        assigned_pop = assigned['Calibrated_pop'].sum() # Gets the population of the assigned candidates.
+
+                        self.gdf.loc[assigned_ids, result_tech] = tech # Assigns the technology to the assigned candidates.
+                        self.gdf.loc[assigned_ids, result_value] = assigned[result_value] # Assigns the maximum net benefit to the assigned candidates.
+                        self.gdf.loc[assigned_ids, 'technology_option'] = 1
+                        unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)] # Updates the unassigned ids.
+                        tech_target_pop_unassigned[tech] -= assigned_pop # Updates the target population of the technology.
+                        print(f'Assigned population to {tech}: ', f"{assigned_pop:.2f}", 'Remaining population: ', f"{tech_target_pop_unassigned[tech]:.2f}\n")
+
+                    tech_target_pop_unassigned = {k: v for k, v in tech_target_pop_unassigned.items() if v > 0}
+
+                    if tech == 'Biogas':
+                        print(f'Prioritizing Biogas.')
+                        col = [f'{target}_{tech}']
+                        target_pop_assign = pop_unassigned
+
+                        condition = self.gdf.loc[isurban, result_tech].isna()
+                        available_cells = self.gdf.loc[condition & isurban].copy() # Selects the cells that are available to be assigned a technology.
+                        if len(available_cells) == 0:
+                            tech_target_pop_unassigned[tech] = -999
+                            print('No available cells to assign, since this the last technology to be assigned, i.e. worst technology.\n')
+                            continue
+                        if target == 'net_benefit':
+                            available_cells[result_tech] = available_cells[col].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
+                        elif target == 'cost_income_ratio':
+                            available_cells[result_tech] = available_cells[col].idxmin(axis=1).astype('string')
+                        available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+                        if target == 'net_benefit':
+                            available_cells[result_value] = available_cells[col].max(axis=1) # Gets the maximum net benefit for the available cells.
+                        elif target == 'cost_income_ratio':
+                            available_cells[result_value] = available_cells[col].min(axis=1)
+
+                        condition = (available_cells[result_tech] == tech)
+                        candidates = available_cells.loc[condition]
+                        if len(candidates) == 0:
+                            if available_cells[f'{target}_{tech}'].isna().all():
+                                tech_target_pop_unassigned[tech] = -999
+                                print('No candidates to assign, since remaining cells are unavailable for this technology.\n')
+                                continue
+                            else:
+                                print(f'No candidates to assign as #{i} best option.\n')
+                                continue
+                        if target == 'net_benefit':
+                            candidates = candidates.sort_values(result_value, ascending=False)
+                        elif target == 'cost_income_ratio':
+                            candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
+                        candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                        assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
+                        if candidates['Calibrated_pop'].sum() > target_pop_assign:
+                            len_assigned = [len(assigned)]
+                            assigned = pd.concat([assigned, candidates.iloc[len_assigned]])
+                            print('Share completed assigned plus one cell.')
+                        assigned_ids = assigned.index.to_list() # Gets the ids of the assigned candidates.
+                        assigned_pop = assigned['Calibrated_pop'].sum() # Gets the population of the assigned candidates.
+
+                        self.gdf.loc[assigned_ids, result_tech] = tech # Assigns the technology to the assigned candidates.
+                        self.gdf.loc[assigned_ids, result_value] = assigned[result_value] # Assigns the maximum net benefit to the assigned candidates.
+                        self.gdf.loc[assigned_ids, 'technology_option'] = 1
+                        unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)] # Updates the unassigned ids.
+                        tech_target_pop_unassigned[tech] -= assigned_pop # Updates the target population of the technology.
+                        print(f'Assigned population to {tech}: ', f"{assigned_pop:.2f}", 'Remaining population: ', f"{tech_target_pop_unassigned[tech]:.2f}\n")
+
+                    tech_target_pop_unassigned = {k: v for k, v in tech_target_pop_unassigned.items() if v > 0}
+
 
             i = 1
             while len(tech_target_pop_unassigned) > 0:
