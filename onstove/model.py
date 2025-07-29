@@ -2346,7 +2346,7 @@ class OnStove(DataProcessor):
             else:
                 isurban = self.gdf['IsUrban'] < 20
 
-            techs_shares = dict(sorted(shares.items(), key=lambda item: item[1], reverse=True))
+            techs_shares = {area: dict(sorted(techs.items(), key=lambda item: item[1], reverse=True)) for area, techs in shares.items()}
             total_pop = self.gdf.loc[isurban, 'Calibrated_pop'].sum()
             tech_target_pop = {tech: int(techs_shares[tech] * total_pop) for tech in techs_shares.keys()}
 
@@ -2359,9 +2359,9 @@ class OnStove(DataProcessor):
             if prioritize:
                 print(f'Prioritizing technology shares in {region} areas.\n')
                 if region == 'Urban':
-                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[0]))
+                    techs_shares = {area: dict(sorted(techs.items(), reverse=True)) for area, techs in shares.items()}
                 elif region == 'Rural':
-                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[0], reverse=True))    
+                    techs_shares = {area: dict(sorted(techs.items())) for area, techs in shares.items()}    
                 for tech, pop_unassigned in tech_target_pop_unassigned.items():
                     if tech == 'Electricity':
                         print(f'Prioritizing Electricity.\n')
