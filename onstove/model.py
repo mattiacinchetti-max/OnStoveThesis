@@ -2346,9 +2346,9 @@ class OnStove(DataProcessor):
             else:
                 isurban = self.gdf['IsUrban'] < 20
 
-            techs_shares = {area: dict(sorted(techs.items(), key=lambda item: item[1], reverse=True)) for area, techs in shares.items()}
+            techs_shares = dict(sorted(shares.items(), key=lambda item: item[1], reverse=True))
             total_pop = self.gdf.loc[isurban, 'Calibrated_pop'].sum()
-            tech_target_pop = {tech: int(techs_shares[tech] * total_pop) for tech in techs_shares.keys()}
+            tech_target_pop = {tech: int(share * total_pop) for tech, share in techs_shares.items()}
 
             unassigned_ids = self.gdf.loc[isurban].index.copy() # Control of cells that are unassigned
             tech_target_pop_unassigned = tech_target_pop.copy() # Control of unassigned population for each technology
@@ -2359,9 +2359,9 @@ class OnStove(DataProcessor):
             if prioritize:
                 print(f'Prioritizing technology shares in {region} areas.\n')
                 if region == 'Urban':
-                    techs_shares = {area: dict(sorted(techs.items(), reverse=True)) for area, techs in shares.items()}
+                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[1], reverse=True))
                 elif region == 'Rural':
-                    techs_shares = {area: dict(sorted(techs.items())) for area, techs in shares.items()}    
+                    techs_shares = dict(sorted(shares.items(), key=lambda item: item[1]))    
                 for tech, pop_unassigned in tech_target_pop_unassigned.items():
                     if tech == 'Electricity':
                         print(f'Prioritizing Electricity.\n')
