@@ -1402,19 +1402,21 @@ class RasterLayer(_Layer):
         append_subdataset: bool
             Add subdataset to existing geopackage.
         """
-        os.makedirs(output_path, exist_ok=True)
+        
         if name is None:
             name = self.name
         output_file = os.path.join(output_path,
                                    name + f'.{type}')
         if type == 'tif':
+            os.makedirs(output_path, exist_ok=True)
             self.path = output_file
             self.meta.update(compress='DEFLATE', driver='GTiff')
             with rasterio.open(output_file, "w", **self.meta) as dest:
                 dest.write(self.data, 1)
         elif type == 'gpkg':
             self.meta.update(driver='GPKG')
-            with rasterio.open(output_file, "w", raster_table = self.name, APPEND_SUBDATASET = append_subdataset,
+            output_file = os.path.join(output_path + f'.{type}')
+            with rasterio.open(output_file, "w", raster_table = name, APPEND_SUBDATASET = append_subdataset,
                                count=1, **self.meta) as dest:
                 dest.write(self.data, 1)
 
