@@ -2048,7 +2048,7 @@ class OnStove(DataProcessor):
         self.gdf['value_of_time'] = norm_layer * self.specs[
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
-    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, 
+    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, prioritize: bool = True,
             affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit'):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
@@ -2151,7 +2151,7 @@ class OnStove(DataProcessor):
         if isinstance(technologies, list):
             self.maximum_net_benefit(techs, restriction=restriction)
         elif isinstance(technologies, dict):
-            self.stove_share_assignment(technologies, restriction=restriction, target=target)
+            self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize)
         if target == 'net_benefit':
             column = 'max_benefit_tech'
         elif target == 'cost_income_ratio':
