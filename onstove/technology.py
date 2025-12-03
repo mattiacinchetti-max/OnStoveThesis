@@ -786,7 +786,9 @@ class Technology:
                         w_spillovers * (self.distributed_spillovers_morb + self.distributed_spillovers_mort) + \
                         w_environment * self.decreased_carbon_costs + w_time * self.time_value
         self.net_benefits = self.benefits - w_costs * self.costs
-        model.gdf["costs_{}".format(self.name)] = self.costs
+        model.gdf["relative_costs_{}".format(self.name)] = self.costs
+        base_costs = model.base_fuel.discounted_fuel_cost + model.base_fuel.discounted_investments + model.base_fuel.om_cost
+        model.gdf["costs_{}".format(self.name)] = self.costs + base_costs
         model.gdf["benefits_{}".format(self.name)] = self.benefits
         model.gdf["net_benefit_{}".format(self.name)] = self.benefits - w_costs * self.costs
         self.factor = pd.Series(np.ones(model.gdf.shape[0]), index=model.gdf.index)

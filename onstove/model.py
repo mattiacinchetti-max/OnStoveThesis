@@ -1602,6 +1602,8 @@ class OnStove(DataProcessor):
                             techs[row['Fuel']] = LPG()
                         elif 'biomass' in row['Fuel'].lower():
                             techs[row['Fuel']] = Biomass()
+                        elif 'ethanol' in row['Fuel'].lower():
+                            techs[row['Fuel']] = LPG()
                         elif 'pellets' in row['Fuel'].lower():
                             techs[row['Fuel']] = Biomass()
                         elif 'charcoal' in row['Fuel'].lower():
@@ -1618,7 +1620,7 @@ class OnStove(DataProcessor):
                         techs[row['Fuel']][row['Param']] = int(row['Value'])
                     elif row['data_type'] == 'float':
                         techs[row['Fuel']][row['Param']] = float(row['Value'])
-                    elif row['data_type'] == 'string':
+                    elif row['data_type'] in ['string', 'str']:
                         techs[row['Fuel']][row['Param']] = str(row['Value'])
                     elif row['data_type'] == 'bool':
                         techs[row['Fuel']][row['Param']] = str(row['Value']).lower() in ['true', 't', 'yes', 'y', '1']
@@ -1672,6 +1674,7 @@ class OnStove(DataProcessor):
         current_elec
         final_elec
         """
+        # TODO: give the option for the user to use a custom distance layer
         if self._electrified_weight is None:
             if "Transformers_dist" in self.gdf.columns:
                 self.gdf["Elec_dist"] = self.gdf["Transformers_dist"]
@@ -1712,19 +1715,17 @@ class OnStove(DataProcessor):
         elec_rate = self.specs["elec_rate"]
 
         self.gdf["Current_elec"] = 0
-
-        i = 1
-        elec_pop = 0
         total_pop = self.gdf["Calibrated_pop"].sum()
 
-        while elec_pop <= total_pop * elec_rate:
-            bool = (self.electrified_weight >= i)
-            elec_pop = self.gdf.loc[bool, "Calibrated_pop"].sum()
-
-            self.gdf.loc[bool, "Current_elec"] = 1
-            i = i - 0.01
-
-        self.i = i
+        index = self.electrified_weight.sort_values(ascending=False).index
+        cum_pop = self.gdf.loc[index, "Calibrated_pop"].cumsum()
+        self.gdf.loc[cum_pop <= total_pop * elec_rate, "Current_elec"] = 1
+        self.gdf.loc[self.gdf['Current_elec'] == 1, "Calibrated_pop"].sum()
+        index_plus_one = index[sum(cum_pop <= total_pop * elec_rate)]
+        self.gdf.loc[self.gdf.iloc[[index_plus_one]].index, 'Current_elec'] = 1
+        self.gdf["Elec_pop_calib"] = 0
+        self.gdf.loc[self.gdf["Current_elec"]==1, "Elec_pop_calib"] = self.gdf.loc[self.gdf["Current_elec"]==1, "Calibrated_pop"]
+        
 
     def final_elec(self):
         """Calibrates the electrified population within each cell.
@@ -2149,7 +2150,7 @@ class OnStove(DataProcessor):
 
         print('Getting maximum net benefit technologies...')
         if isinstance(technologies, list):
-            self.maximum_net_benefit(techs, restriction=restriction)
+            self.maximum_net_benefit(techs, restriction=restriction, partial_access = partial_access)
         elif isinstance(technologies, dict):
             self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize)
         if target == 'net_benefit':
@@ -2999,7 +3000,7 @@ class OnStove(DataProcessor):
 
         return raster, codes, cmap
 
-    def to_gpkg(self, name: Union[str,dict[str, str]], variable: str,
+    def to_gpkg(self, name: str, variable: Union[str,dict[str, str]],
                labels: Optional[dict[str, str]] = None,
                cmap: Optional[dict[str, str]] = None,
                metric: str = 'mean', scaling_factor: int = 1,
@@ -3038,10 +3039,11 @@ class OnStove(DataProcessor):
             save_name = variable
         raster, codes, cmap = self.create_layer(var_name, labels=labels, cmap=cmap, metric=metric, nodata=nodata,
                                                 scaling_factor=scaling_factor)
-        if mask:
+        raster.meta['nodata'] = nodata
+        if mask:   
             raster.meta['nodata'] = mask_nodata
             raster.mask(self.mask_layer)
-        raster.save(os.path.join(self.output_directory), name=save_name, type='gpkg', append_subdataset=append_subdataset)
+        raster.save(os.path.join(self.output_directory, name), name=save_name, type='gpkg', append_subdataset=append_subdataset)
         if codes and cmap:
             with open(os.path.join(self.output_directory, f'{variable}ColorMap.clr'), 'w') as f:
                 for label, code in codes.items():
@@ -4333,7 +4335,7 @@ class OnStove(DataProcessor):
 
         return p
 
-    def plot_affordability(self, variable: str, labels: Optional[dict[str, str]] = None,
+    def plot_affordability(self, variable: str, labels: Optional[dict[str, str]] = None, title: str = None,
                            cmap: Optional[dict[str, str]] = 'viridis', legend_title: Optional[str] = None,
                            ax: Optional['matplotlib.axes.Axes'] = None,
                            bar_variable: str = 'Households',
@@ -4354,7 +4356,7 @@ class OnStove(DataProcessor):
 		
         cmap2 = {cat: color for cat, color in zip(categories, colors)}
 		
-        self.plot(variable, cmap=cmap2, ax=ax,
+        self.plot(variable, cmap=cmap2, ax=ax, title=title,
            figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
            legend_position=(-0.25, 1.05),
            legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
