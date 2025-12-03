@@ -1228,6 +1228,7 @@ class OnStove(DataProcessor):
             'whealth': 'w_health',
             'wspillovers': 'w_spillovers',
             'wtime': 'w_time',
+            'wsalvage': 'w_salvage',
             'countryname': 'country_name',
             'countrycode': 'country_code',
             'populationstartyear': 'population_start_year',
@@ -1708,7 +1709,6 @@ class OnStove(DataProcessor):
         See also
         --------
         electrified_weight
-        final_elec
         read_scenario_data
         specs
         """
@@ -1723,51 +1723,9 @@ class OnStove(DataProcessor):
         self.gdf.loc[self.gdf['Current_elec'] == 1, "Calibrated_pop"].sum()
         index_plus_one = index[sum(cum_pop <= total_pop * elec_rate)]
         self.gdf.loc[self.gdf.iloc[[index_plus_one]].index, 'Current_elec'] = 1
-        self.gdf["Elec_pop_calib"] = 0
+        self.gdf["Elec_pop_calib"] = 0.0
         self.gdf.loc[self.gdf["Current_elec"]==1, "Elec_pop_calib"] = self.gdf.loc[self.gdf["Current_elec"]==1, "Calibrated_pop"]
         
-
-    def final_elec(self):
-        """Calibrates the electrified population within each cell.
-
-        This is a "fine-tuning" of the electrified population. It uses the ``Current_elec`` column of the :attr:`gdf`
-        GeoDataFrame (calculated using the :meth:`current_elec` method) and the ``Calibrated_pop`` column (calculated
-        using the :meth:`calibrate_current_pop` method) to get the population that is electrified within each
-        electrified settlement, according to the ``Elec_rate`` provided by the user (stored in :attr:`specs`).
-
-        See also
-        --------
-        electrified_weight
-        current_elec
-        read_scenario_data
-        specs
-        """
-        elec_rate = self.specs["elec_rate"]
-
-        self.gdf["Elec_pop_calib"] = self.gdf["Calibrated_pop"]
-
-        i = self.i + 0.01
-        total_pop = self.gdf["Calibrated_pop"].sum()
-        elec_pop = self.gdf.loc[self.gdf["Current_elec"] == 1, "Calibrated_pop"].sum()
-        diff = elec_pop - (total_pop * elec_rate)
-        factor = diff / self.gdf["Current_elec"].count()
-
-        while elec_pop > total_pop * elec_rate:
-
-            new_bool = (self.i <= self.electrified_weight) & (self.electrified_weight <= i)
-
-            self.gdf.loc[new_bool, "Elec_pop_calib"] -= factor
-            self.gdf.loc[self.gdf["Elec_pop_calib"] < 0, "Elec_pop_calib"] = 0
-            self.gdf.loc[self.gdf["Elec_pop_calib"] == 0, "Current_elec"] = 0
-            bool = self.gdf["Current_elec"] == 1
-
-            elec_pop = self.gdf.loc[bool, "Elec_pop_calib"].sum()
-
-            new_bool = bool & new_bool
-            if new_bool.sum() == 0:
-                i = i + 0.01
-
-        self.gdf.loc[self.gdf["Current_elec"] == 0, "Elec_pop_calib"] = 0
 
     def calibrate_current_pop(self):
         """Calibrates the spatial population in each cell according to the user defined population in the start year
@@ -2050,7 +2008,7 @@ class OnStove(DataProcessor):
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
     def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, prioritize: bool = True,
-            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit'):
+            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
         It loops through the ``technologies`` and calculates all costs, benefit and the net-benefit of cooking with

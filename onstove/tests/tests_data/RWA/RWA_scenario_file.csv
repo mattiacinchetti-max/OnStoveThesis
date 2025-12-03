@@ -14,3 +14,4 @@ w_environment,1,float
 w_health,1,float
 w_spillovers,1,float
 w_time,1,float
+w_salvage,1,float

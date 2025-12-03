@@ -67,7 +67,6 @@ def test_prepare_model():
                               
     # 8. Calibrate current electrified population
     model.current_elec()
-    model.final_elec()
     rate = model.gdf['Elec_pop_calib'].sum() / model.gdf['Calibrated_pop'].sum()
     assert abs(rate - model.specs['elec_rate']) <= 0.05
     

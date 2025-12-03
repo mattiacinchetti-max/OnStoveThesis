@@ -863,7 +863,7 @@ class RasterLayer(_Layer):
                  normalization: Optional[str] = 'MinMax', inverse: bool = False,
                  distance_method:  Optional[str] = None,
                  distance_limit: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-                 resample: str = 'nearest', band=1, band=1, window: Optional[windows.Window] = None,
+                 resample: str = 'nearest', band=1, window: Optional[windows.Window] = None,
                  rescale: bool = False):
         """
         Initializes the class with user defined or default parameters.
@@ -878,7 +878,7 @@ class RasterLayer(_Layer):
                          normalization=normalization, inverse=inverse,
                          distance_method=distance_method,
                          distance_limit=distance_limit)
-        self.read_layer(path, conn, band=band, band=band, window=window)
+        self.read_layer(path, conn, band=band, window=window)
 
     def __repr__(self):
         return 'Raster' + super().__repr__()
@@ -895,7 +895,7 @@ class RasterLayer(_Layer):
                                       self.meta['width'],
                                       self.meta['transform'])
 
-    def read_layer(self, path, conn=None, band=1, band=1, window=None):
+    def read_layer(self, path, conn=None, band=1, window=None):
         """Reads a dataset from a GIS raster data file.
 
         It works as a wrapper method that uses :doc:`rasterio.open()<rasterio:index>` to read raster data and

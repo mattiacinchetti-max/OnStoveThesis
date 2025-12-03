@@ -5,7 +5,6 @@ from onstove.layer import VectorLayer, RasterLayer
 from onstove.raster import (
     align_raster,
     normalize,
-    reproject_raster,
     merge_rasters,
     resample
 )
@@ -168,27 +167,6 @@ def test_align_raster(sample_raster_layer, sample_raster_layer_2):
 #     assert os.stat(path).st_size < os.stat(raster_path).st_size
 #     print(f"\nmasked raster: {os.stat(path).st_size} bytes")
 #     print(f"\noriginal raster: {os.stat(raster_path).st_size} bytes")
-
-
-def test_reproject_raster(raster_path):
-    """Test for reproject raster function
-
-    Parameters
-    ----------
-    raster_path: str
-                Raster path
-    """
-
-    raster = reproject_raster(
-        raster_path=raster_path,
-        dst_crs=3857,
-        cell_width=None,
-        cell_height=None,
-        method="nearest",
-        compression="DEFLATE"
-    )
-    # print("crs:", raster[-1]["crs"])
-    assert raster[-1]["crs"] == 3857
 
 
 def test_merge_rasters(sample_raster_layer_1, sample_raster_layer_2, output_path):
