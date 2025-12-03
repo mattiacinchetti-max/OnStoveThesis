@@ -1045,7 +1045,8 @@ class RasterLayer(_Layer):
             self.save(output_path)
 
     def reproject(self, crs: rasterio.crs.CRS, output_path: Optional[str] = None,
-                  cell_width: Optional[float] = None, cell_height: Optional[float] = None):
+                  cell_width: Optional[float] = None, cell_height: Optional[float] = None,
+                  method: str = 'nearest'):
         """Reprojects the raster data into a specified coordinate system.
 
         Uses the :doc:`rasterio.features.rasterize<rasterio:api/rasterio.features>` function to reproject the current
@@ -1065,13 +1066,46 @@ class RasterLayer(_Layer):
         cell_height: float, optional
             The cell height in units consistent with the raster's crs. If provided the transform of the raster will be
             adjusted accordingly.
+        method: str
+            Resampling method.
         """
         if (self.meta['crs'] != crs) or cell_width:
-            data, meta = reproject_raster(self.path, crs,
-                                          cell_width=cell_width, cell_height=cell_height,
-                                          method=self.resample, compression='DEFLATE')
-            self.data = data
-            self.meta = meta
+
+            transform, width, height = calculate_default_transform(self.meta['crs'], crs,
+                                                                   self.meta['width'],
+                                                                   self.meta['height'],
+                                                                   *self.bounds)
+            # If a destination cell width and height was provided, then it
+            # calculates the new boundaries, with, heigh and transform
+            # depending on the new cell size.
+            if cell_width and cell_height:
+                bounds = rasterio.transform.array_bounds(height, width, transform)
+                width = int(width * (transform[0] / cell_width))
+                height = int(height * (abs(transform[4]) / cell_height))
+                transform = rasterio.transform.from_origin(bounds[0], bounds[3],
+                                                           cell_width, cell_height)
+            # Updates the metadata
+            out_meta = self.meta.copy()
+            out_meta.update({
+                'crs': crs,
+                'transform': transform,
+                'width': width,
+                'height': height,
+                'compress': 'DEFLATE'
+            })
+            destination = np.full((height, width), self.meta['nodata'])
+            reproject(
+                source=self.data,
+                destination=destination,
+                src_transform=self.meta['transform'],
+                src_crs=self.meta['crs'],
+                dst_transform=transform,
+                dst_crs=crs,
+                resampling=Resampling[method])
+
+            self.data = destination
+            self.meta = out_meta
+
             if output_path:
                 self.save(output_path)
 
