@@ -3978,7 +3978,7 @@ class OnStove(DataProcessor):
                               **_kwargs
                               )
              + scale_fill_manual(cmap)
-             + scale_color_manual(cmap, guide=False)
+             + scale_color_manual(cmap, guide=None)
              + theme_name
              + theme(text=element_text(**_font_args))
              + wrap
@@ -4276,7 +4276,7 @@ class OnStove(DataProcessor):
         if groupby.lower() == 'urbanrural':
             p += labs(x='Settlement')
         else:
-            p += theme(legend_position="none")
+            p += theme(legend_position=None)
 
         if quantiles:
             p = self._plot_quantiles(p, x_variable=x, y_variable='Households')
