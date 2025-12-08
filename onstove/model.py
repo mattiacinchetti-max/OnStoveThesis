@@ -1493,25 +1493,54 @@ class OnStove(DataProcessor):
 
     def set_baseline_map(self, baseline_map: gpd.GeoDataFrame, column_map: dict[str, str]) -> dict:
         """Sets the baseline fuel shares using a spatial overlay.
-
+    
         Parameters
         ----------
         baseline_map : gpd.GeoDataFrame
             A GeoDataFrame containing polygons with fuel share attributes.
         column_map : dict
             A mapping from column names in the baseline_map to technology names in the model.
-
+    
         This function performs a spatial join between the baseline_map and the model's main GeoDataFrame (self.gdf).
         It then extracts the fuel share information based on the provided column_map and assigns it to the corresponding
-        technologies in the model.
+        technologies in the model. For cells that don't intersect any polygon, it finds the nearest polygon.
         """
         # Checking crs and matching baseline_map to self.gdf crs
         if baseline_map.crs != self.gdf.crs:
             baseline_map = baseline_map.to_crs(self.gdf.crs)
         
         # Spatial join baseline_map to self.gdf
-       
-        self.gdf = gpd.sjoin(self.gdf, baseline_map[list(column_map.keys()) + ['geometry']], how='left', predicate='intersects') #type: ignore
+        self.gdf = gpd.sjoin(self.gdf, baseline_map[list(column_map.keys()) + ['geometry']], 
+                            how='left', predicate='intersects')
+        
+        # Find cells without matches (where index_right is NaN)
+        unmatched_mask = self.gdf['index_right'].isna()
+        n_unmatched = unmatched_mask.sum()
+        
+        if n_unmatched > 0:
+            print(f"Warning: {n_unmatched} cells did not intersect any baseline polygon. Finding nearest polygons...")
+            
+            # Get unmatched cells
+            unmatched_gdf = self.gdf.loc[unmatched_mask].copy()
+            
+            # For each unmatched cell, find nearest polygon
+            for idx in unmatched_gdf.index:
+                point = unmatched_gdf.loc[idx, 'geometry']
+                
+                # Calculate distances to all polygons
+                distances = baseline_map.geometry.distance(point)
+                nearest_idx = distances.idxmin()
+                
+                # Assign values from nearest polygon
+                for col in column_map.keys():
+                    self.gdf.loc[idx, col] = baseline_map.loc[nearest_idx, col]
+                
+                # Update index_right to indicate it was matched (using negative index to distinguish)
+                self.gdf.loc[idx, 'index_right'] = -(nearest_idx + 1)
+            
+            print(f"Successfully assigned baseline data to all {n_unmatched} unmatched cells using nearest neighbor.")
+        
+        # Create base_fuels dictionary
         base_fuels = {}
         for col, tech_name in column_map.items():
             tech_share = pd.Series(self.gdf[col].values, index=self.gdf.index, dtype=float).fillna(0.0)
