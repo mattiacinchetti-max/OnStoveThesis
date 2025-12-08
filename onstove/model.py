@@ -2069,7 +2069,7 @@ class OnStove(DataProcessor):
         self.gdf['value_of_time'] = norm_layer * self.specs[
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
-    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, prioritize: bool = True,
+    def run(self, technologies: Optional[Union[list, dict, str]] = 'all', restriction: bool = True, prioritize: bool = True,
             affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
@@ -4132,7 +4132,7 @@ class OnStove(DataProcessor):
                               **kwargs
                               )
              + scale_fill_manual(cmap)
-             + scale_color_manual(cmap, guide=False)
+             + scale_color_manual(cmap, guide=None)
              + theme_minimal()
              + theme(text=element_text(**font_args))
              + labs(x=x_title, y=y_title, fill='Cooking technology')
