@@ -4183,7 +4183,11 @@ class OnStove(DataProcessor):
             Figure object used to plot the distribution
         """
         if best_mix:
-            df = self.gdf[[fill, 'Calibrated_pop', 'Households', 'maximum_net_benefit',
+            if fill == 'max_benefit_tech':
+                fill_value = 'maximum_net_benefit'
+            elif fill == 'most_affordable_tech':
+                fill_value = 'most_affordable_cost_income_ratio'
+            df = self.gdf[[fill, 'Calibrated_pop', 'Households', fill_value,
                            'health_costs_avoided', 'opportunity_cost_gained', 'emission_costs_avoided',
                            'investment_costs', 'salvage_value', 'fuel_costs', 'om_costs', 
                            'relative_wealth', 'value_of_time']].copy()
