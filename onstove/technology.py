@@ -126,6 +126,7 @@ class Technology:
         self.benefits = None
         self.net_benefits = None
         self.gdf = gpd.GeoDataFrame()
+        self.categories = []
 
     def __setitem__(self, idx, value):
         self.__dict__[idx] = value
@@ -710,6 +711,8 @@ class Technology:
         --------
         onstove.OnStove.income_estimation
         """
+        self.categories = categories
+        
         try:
             if model.income_data:
                 model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / model.gdf['income']
@@ -719,7 +722,7 @@ class Technology:
             model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['cost_income_ratio_{}'.format(self.name)].clip(lower=0)
         
             bins = [0.0]
-            for cat in categories:
+            for cat in self.categories:
                 if '<' in cat:
                     upper = float(cat.strip('<%')) / 100
                     bins.append(upper)
@@ -732,16 +735,16 @@ class Technology:
                 
                 bins = sorted(set(bins))
 
-            model.gdf['affordability_category_{}'.format(self.name)] = pd.cut(model.gdf['cost_income_ratio_{}'.format(self.name)], bins=bins, labels=categories, right=False)
+            model.gdf['affordability_category_{}'.format(self.name)] = pd.cut(model.gdf['cost_income_ratio_{}'.format(self.name)], bins=bins, labels=self.categories, right=False)
             model.gdf['affordability_category_{}'.format(self.name)] = model.gdf['affordability_category_{}'.format(self.name)].cat.add_categories(['Not available'])
-            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] > 1, 'affordability_category_{}'.format(self.name)] = categories[-1]
-            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] < 0, 'affordability_category_{}'.format(self.name)] = categories[0]
+            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] > 1, 'affordability_category_{}'.format(self.name)] = self.categories[-1]
+            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] < 0, 'affordability_category_{}'.format(self.name)] = self.categories[0]
 
 
         except KeyError:
             raise KeyError(f"The affordability categories could not be assigned for {self.name}.")
                     
-        affordability_target = float(categories[0].strip('<%')) / 100
+        affordability_target = float(self.categories[0].strip('<%')) / 100
         if model.income_data:
             model.gdf['affordability_support_required_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / affordability_target - model.gdf['income']
         else:

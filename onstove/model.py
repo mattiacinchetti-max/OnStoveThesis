@@ -7,6 +7,7 @@ from warnings import warn
 import dill
 import matplotlib
 import csv
+from matplotlib.ticker import FuncFormatter
 from pyproj import CRS
 import pandas as pd
 import numpy as np
@@ -19,7 +20,7 @@ from copy import copy
 from csv import DictReader
 from time import time
 from matplotlib import cm
-from matplotlib.colors import to_rgb
+from matplotlib.colors import BoundaryNorm, to_rgb, LinearSegmentedColormap, to_hex
 from matplotlib.offsetbox import (TextArea, AnnotationBbox, VPacker, HPacker)
 from rasterio import features
 from rasterio.fill import fillnodata
@@ -59,7 +60,6 @@ from onstove._layer_utils import raster_setter
 import scipy.stats as stats
 from scipy.interpolate import PchipInterpolator
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
 
 
@@ -4297,62 +4297,69 @@ class OnStove(DataProcessor):
 
         return p
 
-    def plot_affordability(self, variable: str, labels: Optional[dict[str, str]] = None, title: str = None,
+    def plot_affordability(self, fuel: str, labels: Optional[dict[str, str]] = None, title: str = None,
                            cmap: Optional[dict[str, str]] = 'viridis', legend_title: Optional[str] = None,
                            ax: Optional['matplotlib.axes.Axes'] = None,
                            bar_variable: str = 'Households',
-                           categories: list = ['<5%', '5-10%', '10-15%', '15-20%', '20-25%', '25-30%', '30%+'],
+                           categories: list = [],
                            colors: list = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey'],
                            dpi: float = 150, save_as: Optional[str] = None) -> matplotlib.axes.Axes:
-        """Expands map plotting function specifically for affordability maps.
-        Parameters
-        """
-        if colors:
-            cmap = ListedColormap(colors)
+        """Expands map plotting function specifically for affordability maps."""
+        
+        variable = f'affordability_category_{fuel}'
 
-        categories.append('Not available')
-        patches = [mpatches.Patch(color=c, label=l) for c, l in zip(colors, categories)]
-        category_color_map = dict(zip(categories, colors))
+        categories = list(self.techs[fuel].categories or [])
+        if 'Not available' not in categories:
+            categories.append('Not available')
+
+        if not colors:
+            colors = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey']
+        grad_colors = colors[:-1]            # green→red palette
+        grey = colors[-1]
+        n_grad = max(len(categories) - 1, 0)
+        if n_grad == 0:
+            colors_use = [grey]
+        else:
+            grad_cmap = LinearSegmentedColormap.from_list('aff_grad', grad_colors)
+            colors_use = [to_hex(grad_cmap(v)) for v in np.linspace(0, 1, n_grad)]
+            colors_use.append(grey)
+
+        cmap = {cat: col for cat, col in zip(categories, colors_use)}
+        category_color_map = cmap
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-		
-        cmap2 = {cat: color for cat, color in zip(categories, colors)}
-		
-        self.plot(variable, cmap=cmap2, ax=ax, title=title,
-           figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
-           legend_position=(-0.25, 1.05),
-           legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
-           stats=False, #stats_kwargs={'stats_position': (0.1, 0.15)},
-           rasterized=True, dpi=300,
-           # scale_bar=scale_bar_prop,
-           # north_arrow=north_arrow_prop,
-           )
-        
-        # self.gdf.plot(column=variable, legend=True, cmap=cmap, ax=ax, markersize=0.1, rasterized=True)
-        # ax.legend(handles=patches, title="Cost/Income ratio", 
-                  # loc='upper left', bbox_to_anchor=(-0.25, 1.05), fontsize=9, title_fontsize=10)
-        # ax.set_title(title, fontsize=12)
-        # ax.axis('off')
 
-        counts = self.gdf.groupby(variable)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
+        self.plot(variable, cmap=cmap, ax=ax, title=title,
+                  figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
+                  legend_position=(-0.25, 1.05),
+                  legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
+                  stats=False, rasterized=True, dpi=300)
+
+        counts = self.gdf.groupby(variable, observed=False)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
         counts = counts.reindex(categories).fillna(0)
         labels = counts.index
         values = counts.values
         bar_colors = [category_color_map[label] for label in labels]
 
-        axins = inset_axes(ax, width="23%", height="23%", loc='lower left', borderpad=1.5)
+        axins = inset_axes(ax, width="20%", height="20%", loc='lower left', borderpad=1.5)
         bars = axins.bar(labels, values, color=bar_colors, edgecolor='black')
         axins.set_title(f'{bar_variable} share', fontsize=8)
         axins.set_ylim(0, 1)
+        axins.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
         axins.tick_params(axis='x', labelrotation=45, labelsize=7)
         axins.tick_params(axis='y', labelsize=7)
 
         for bar in bars:
             yval = bar.get_height()
-            axins.text(bar.get_x() + bar.get_width()/2 + 0.1, yval + 0.025, f"{yval:.0%}", ha='center', fontsize=6)
+            axins.text(bar.get_x() + bar.get_width()/2, yval + 0.025, f"{yval:.0%}",
+                       ha='center', fontsize=6)
 
         if isinstance(save_as, str):
-            plt.savefig(os.path.join(self.output_directory, save_as), dpi=dpi, bbox_inches='tight', transparent=True)
+            path = os.path.join(self.output_directory, 'Cost_income')
+            os.makedirs(path, exist_ok=True)
+            plt.savefig(os.path.join(path, save_as), dpi=dpi, bbox_inches='tight', transparent=True)
+
+        return ax
 
     
     def to_csv(self, name: str):
