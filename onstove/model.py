@@ -61,7 +61,7 @@ import scipy.stats as stats
 from scipy.interpolate import PchipInterpolator
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from matplotlib.colors import ListedColormap
-
+import copy
 
 
 def timeit(func):
@@ -111,7 +111,7 @@ class DataProcessor:
     """
 
     def __init__(self, project_crs: Optional[Union['pyproj.CRS', int]] = 3395,
-                 cell_size: tuple[float] = (1000,1000), output_directory: str = '.'):
+                 cell_size: tuple[float, float] = (1000.0, 1000.0), output_directory: str = '.'):
         """
         Initializes the class and sets an empty layers dictionaries.
         """
@@ -130,7 +130,10 @@ class DataProcessor:
 
         self.layers = {}
         self.project_crs = project_crs
-        self.cell_size = cell_size
+        try:
+            self.cell_size = (float(cell_size[0]), float(cell_size[1]))
+        except Exception: # allow a single scalar to mean square cells
+            self.cell_size = (float(cell_size), float(cell_size))        
         self.output_directory = output_directory
         self.mask_layer = None
         self.conn = None
@@ -1487,8 +1490,75 @@ class OnStove(DataProcessor):
             if (name != "Biogas") & (name != "Electricity"):
                 tech.pop_sqkm.loc[isurban] = remaining_urbpop * tech.current_share_urban / remaining_urbshare
             tech.pop_sqkm = tech.pop_sqkm / self.gdf["Calibrated_pop"]
+
+    def set_baseline_map(self, baseline_map: gpd.GeoDataFrame, column_map: dict[str, str]) -> dict:
+        """Sets the baseline fuel shares using a spatial overlay.
+    
+        Parameters
+        ----------
+        baseline_map : gpd.GeoDataFrame
+            A GeoDataFrame containing polygons with fuel share attributes.
+        column_map : dict
+            A mapping from column names in the baseline_map to technology names in the model.
+    
+        This function performs a spatial join between the baseline_map and the model's main GeoDataFrame (self.gdf).
+        It then extracts the fuel share information based on the provided column_map and assigns it to the corresponding
+        technologies in the model. For cells that don't intersect any polygon, it finds the nearest polygon.
+        """
+        # Checking crs and matching baseline_map to self.gdf crs
+        if baseline_map.crs != self.gdf.crs:
+            baseline_map = baseline_map.to_crs(self.gdf.crs)
         
-    def set_base_fuel(self, techs: list = None):
+        # Spatial join baseline_map to self.gdf
+        self.gdf = gpd.sjoin(self.gdf, baseline_map[list(column_map.keys()) + ['geometry']], 
+                            how='left', predicate='intersects')
+        
+        # Find cells without matches (where index_right is NaN)
+        unmatched_mask = self.gdf['index_right'].isna()
+        n_unmatched = unmatched_mask.sum()
+        
+        if n_unmatched > 0:
+            print(f"Warning: {n_unmatched} cells did not intersect any baseline polygon. Finding nearest polygons...")
+            
+            # Get unmatched cells
+            unmatched_gdf = self.gdf.loc[unmatched_mask].copy()
+            
+            # For each unmatched cell, find nearest polygon
+            for idx in unmatched_gdf.index:
+                point = unmatched_gdf.loc[idx, 'geometry']
+                
+                # Calculate distances to all polygons
+                distances = baseline_map.geometry.distance(point)
+                nearest_idx = distances.idxmin()
+                
+                # Assign values from nearest polygon
+                for col in column_map.keys():
+                    self.gdf.loc[idx, col] = baseline_map.loc[nearest_idx, col]
+                
+                # Update index_right to indicate it was matched (using negative index to distinguish)
+                self.gdf.loc[idx, 'index_right'] = -(nearest_idx + 1)
+            
+            print(f"Successfully assigned baseline data to all {n_unmatched} unmatched cells using nearest neighbor.")
+        
+        # Create base_fuels dictionary
+        base_fuels = {}
+        for col, tech_name in column_map.items():
+            tech_share = pd.Series(self.gdf[col].values, index=self.gdf.index, dtype=float).fillna(0.0)
+            if tech_name in self.techs.keys():
+                self.techs[tech_name].pop_sqkm = tech_share
+            else:
+                raise KeyError(f"Technology {tech_name} not found in model technologies.")
+            base_fuels[tech_name] = self.techs[tech_name]
+        
+        return base_fuels    
+        
+    
+    def set_base_fuel(
+            self,
+            techs: Optional[list] = None,
+            baseline_map: Optional[gpd.GeoDataFrame] = None,
+            column_map: Optional[dict[str, str]] = None,
+            ) -> None:
         """Defines the base fuel properties according to the technologies currently used in the study area.
 
         The user can either set `is_base = True` to a subclass of the technology class (e.g. biogas or LPG).
@@ -1508,14 +1578,22 @@ class OnStove(DataProcessor):
         Technology.health_parameters
         Technology.discount_fuel_cost
         """
-        if techs is None:
-            techs = list(self.techs.values())
-        base_fuels = {}
-        for tech in techs:
-            share = tech.current_share_rural + tech.current_share_urban
-            if (share >= 0) or tech.is_base:
-                tech.is_base = True
-                base_fuels[tech.name] = tech
+        if baseline_map is not None:
+            if column_map is None:
+                raise ValueError("If baseline_map is provided, column_map must also be provided.")
+            base_fuels = self.set_baseline_map(baseline_map=baseline_map, column_map=column_map)
+        
+        else:
+            
+            if techs is None:
+                techs = list(self.techs.values())
+            base_fuels = {}
+            for tech in techs:
+                share = tech.current_share_rural + tech.current_share_urban
+                if (share >= 0) or tech.is_base:
+                    tech.is_base = True
+                    base_fuels[tech.name] = tech
+        # Ignore
         if len(base_fuels) == 1:
             self.base_fuel = copy(list(base_fuels.values())[0])
             self.base_fuel.carb(self)
@@ -1529,33 +1607,46 @@ class OnStove(DataProcessor):
                                                 index=self.gdf.index)
             self.base_fuel.om_cost = pd.Series([self.base_fuel.om_cost] * self.gdf.shape[0],
                                                index=self.gdf.index)
+        # Ignore ends
+
         else:
-            if len(base_fuels) == 0:
-                base_fuels = self.techs
-            base_fuel = Technology(name='Base fuel')
-            base_fuel.carbon = 0
-            base_fuel.total_time_yr = 0
+            
+            if baseline_map is not None:
+                # Call the new function
+                base_fuel = Technology(name='Base fuel')
+                base_fuel.carbon = 0
+                base_fuel.total_time_yr = 0
+                # pass
+            
+            else:
+                base_fuel = Technology(name='Base fuel')
+                base_fuel.carbon = 0
+                base_fuel.total_time_yr = 0
 
-            # base_tech_types = [type(tech) for tech in base_fuels.values()]
+                # base_tech_types = [type(tech) for tech in base_fuels.values()]
 
-            self._techshare_sumtoone()
-            self._ecooking_adjustment()
-            base_fuels["Biogas"].total_time(self)
-            required_energy_hh = base_fuels["Biogas"].required_energy_hh(self)
-            factor = self.gdf['biogas_energy'] / (required_energy_hh * self.gdf['Households'])
-            factor[factor > 1] = 1
-            base_fuels["Biogas"].factor = factor
-            base_fuels["Biogas"].households = self.gdf['Households'] * factor
-            self._biogas_adjustment()
-            self._pop_tech()
-            self._techshare_allocation(base_fuels)
+                self._techshare_sumtoone()
+                self._ecooking_adjustment()
+                base_fuels["Biogas"].total_time(self)
+                required_energy_hh = base_fuels["Biogas"].required_energy_hh(self)
+                factor = self.gdf['biogas_energy'] / (required_energy_hh * self.gdf['Households'])
+                factor[factor > 1] = 1
+                base_fuels["Biogas"].factor = factor
+                base_fuels["Biogas"].households = self.gdf['Households'] * factor
+                self._biogas_adjustment()
+                self._pop_tech()
+                self._techshare_allocation(base_fuels)
 
             self.get_clean_cooking_access(base_fuels=base_fuels)
+
+                
 
             for name, tech in base_fuels.items():
 
                 tech.carb(self)
                 if name != "Biogas":
+                    tech.total_time(self)
+                else:
                     tech.total_time(self)
                 tech.required_energy(self)
 
@@ -2007,7 +2098,7 @@ class OnStove(DataProcessor):
         self.gdf['value_of_time'] = norm_layer * self.specs[
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
-    def run(self, technologies: Union[list, dict] = 'all', restriction: bool = True, prioritize: bool = True,
+    def run(self, technologies: Optional[Union[list, dict, str]] = 'all', restriction: bool = True, prioritize: bool = True,
             affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
@@ -2251,7 +2342,7 @@ class OnStove(DataProcessor):
     # TODO: check if we need this method
 
     def stove_share_assignment(self, techs: dict[str:dict[str:float]], target: str = 'net_benefit', 
-                               restriction: bool = True, prioritize: bool = True):
+                               restriction: bool = True, prioritize: bool = True, clear_none: bool = True):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell
         while achieving user defined shares.
 
@@ -2417,7 +2508,7 @@ class OnStove(DataProcessor):
                     if target == 'net_benefit':
                         candidates = candidates.sort_values(result_value, ascending=False)
                     elif target == 'cost_income_ratio':
-                        candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
+                        candidates = candidates.sort_values(result_value, ascending=True) # ascending = True, depends on the question being asked regarding affordability.
                     candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
 
                     assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
@@ -2445,6 +2536,24 @@ class OnStove(DataProcessor):
                 self.gdf.loc[condition, result_tech] = 'None'
 
         print('\nFinal shares ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
+
+        if clear_none:
+            print(f'\nClearing None assignments by assigning the best available technology for the {target} target.')
+            are_none = self.gdf[self.gdf[result_tech] == 'None']
+            if target == 'net_benefit':
+                are_none[result_tech] = are_none[cols].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
+                are_none[result_value] = are_none[cols].max(axis=1) # Gets the maximum net benefit for the available cells.
+            elif target == 'cost_income_ratio':
+                are_none[result_tech] = are_none[cols].idxmin(axis=1).astype('string')
+                are_none[result_value] = are_none[cols].min(axis=1)
+            are_none[result_tech] = are_none[result_tech].str.replace(f"{target}_", "")
+
+            assigned_ids = are_none.index.to_list() # Gets the ids of the assigned candidates.
+            self.gdf.loc[assigned_ids, result_tech] = tech # Assigns the technology to the assigned candidates.
+            self.gdf.loc[assigned_ids, result_value] = assigned[result_value] # Assigns the maximum net benefit to the assigned candidates.
+            self.gdf.loc[assigned_ids, 'technology_option'] = i
+            print('Final shares after clearing None assignments ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
+            
 
     def _add_admin_names(self, admin, column_name):
         if isinstance(admin, str):
@@ -2786,11 +2895,23 @@ class OnStove(DataProcessor):
             dff = self.gdf
         height, width = RasterLayer.shape_from_cell(bounds, cell_height, cell_width)
         transform = rasterio.transform.from_bounds(*bounds, width, height)
+        # drop duplicate geometries to avoid duplicate row/col computations
         geometry = dff["geometry"].apply(lambda geom: geom.wkb)
         gdf = dff.loc[geometry.drop_duplicates().index]
+
+        # compute row/col and ensure integer type
         rows, cols = rasterio.transform.rowcol(transform, gdf['geometry'].x, gdf['geometry'].y)
-        self.rows = np.array(rows)
-        self.cols = np.array(cols)
+        rows = np.array(rows, dtype=int)
+        cols = np.array(cols, dtype=int)
+
+        # clip to valid index range [0, height-1] / [0, width-1] to avoid out-of-bounds
+        if rows.size:
+            rows = np.clip(rows, 0, max(0, int(height) - 1))
+        if cols.size:
+            cols = np.clip(cols, 0, max(0, int(width) - 1))
+
+        self.rows = rows
+        self.cols = cols
         self.base_layer = self._empty_raster_from_shape(self.gdf.crs, transform, height, width)
 
     def create_layer(self, variable: str, name: Optional[str] = None,
@@ -4040,7 +4161,7 @@ class OnStove(DataProcessor):
                               **kwargs
                               )
              + scale_fill_manual(cmap)
-             + scale_color_manual(cmap, guide=False)
+             + scale_color_manual(cmap, guide=None)
              + theme_minimal()
              + theme(text=element_text(**font_args))
              + labs(x=x_title, y=y_title, fill='Cooking technology')
@@ -4055,10 +4176,13 @@ class OnStove(DataProcessor):
         line1 = geom_vline(xintercept=q1, color="#4D4D4D", size=0.8, linetype="dashed")
         line3 = geom_vline(xintercept=q3, color="#4D4D4D", size=0.8, linetype="dashed")
 
-        hist = hist + line1 + line3
+        plot = hist + line1 + line3
 
-        # get figure to annotate
-        fig = hist.draw()  # get the matplotlib figure object
+        fig = plot.draw()  # get the matplotlib figure object
+        for ax in fig.axes:
+            for im in ax.images:
+                if hasattr(im.get_array(), "setflags"):
+                    im.get_array().setflags(write=True)
         plt.close()
         ax = fig.axes[0]  # get the matplotlib axes (more than one if faceted)
 
@@ -4379,3 +4503,170 @@ class OnStove(DataProcessor):
 
         df = pd.DataFrame(pt.drop(columns='geometry'))
         df.to_csv(name, index=False)
+
+    def subset_by_country(self,
+                          country_code: Optional[str] = None,
+                          country_gdf: Optional['gpd.GeoDataFrame'] = None,
+                          country_col: str = 'country',
+                          in_place: bool = False) -> 'OnStove':
+        """
+        Return (or modify in_place) an OnStove instance filtered to the given country.
+        - country_code: value found in self.gdf[country_col]
+        - country_gdf: geopandas.GeoDataFrame providing polygon(s) to spatially select cells (no BaseGeometry import)
+        Preserves original dtypes for attributes and crops 2D rasters when possible.
+        """
+
+        if country_code is None and country_gdf is None:
+            raise ValueError("Provide country_code or country_gdf")
+
+        # build boolean mask on original gdf
+        if country_code is not None:
+            mask = self.gdf[country_col] == country_code
+        else:
+            if not isinstance(country_gdf, gpd.GeoDataFrame):
+                raise ValueError("country_gdf must be a geopandas.GeoDataFrame")
+            # dissolve to single geometry then intersect
+            geom = country_gdf.unary_union
+            mask = self.gdf.geometry.intersects(geom)
+
+        if mask.sum() == 0:
+            raise ValueError("No rows match the given country filter")
+
+        original_len = len(self.gdf)
+        mask_arr = mask.to_numpy()
+
+        target = self if in_place else copy.deepcopy(self)
+
+        # subset gdf and reset index
+        target.gdf = self.gdf.loc[mask].copy().reset_index(drop=True)
+
+        # get original full-grid shape (height, width) from base_layer if available
+        grid_shape = None
+        if hasattr(self, 'base_layer') and getattr(self, 'base_layer') is not None:
+            try:
+                # RasterLayer.meta uses width/height or data.shape
+                if hasattr(self.base_layer, 'data') and getattr(self.base_layer, 'data') is not None:
+                    grid_shape = tuple(self.base_layer.data.shape)
+                elif isinstance(self.base_layer, dict) or isinstance(self.base_layer, object):
+                    meta = getattr(self.base_layer, 'meta', None)
+                    if meta is not None and 'height' in meta and 'width' in meta:
+                        grid_shape = (meta['height'], meta['width'])
+            except Exception:
+                grid_shape = None
+
+        # compute crop window if original 'row' and 'col' columns present in original gdf and we have grid_shape
+        if {'row', 'col'}.issubset(self.gdf.columns) and grid_shape is not None:
+            sel_rows = self.gdf.loc[mask, 'row'].astype(int)
+            sel_cols = self.gdf.loc[mask, 'col'].astype(int)
+            r0, r1 = int(sel_rows.min()), int(sel_rows.max())
+            c0, c1 = int(sel_cols.min()), int(sel_cols.max())
+            crop_slice = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+        else:
+            crop_slice = None
+
+        # subset other attributes preserving dtypes where possible
+        for name, val in list(self.__dict__.items()):
+            if name == 'gdf':
+                continue
+            # skip non-sized attrs
+            try:
+                ln = len(val)
+            except Exception:
+                continue
+
+            # attributes aligned to per-cell length -> subset
+            if ln == original_len:
+                # pandas Series
+                if isinstance(val, pd.Series):
+                    setattr(target, name, val.loc[mask].reset_index(drop=True))
+                # pandas DataFrame: subset rows
+                elif isinstance(val, pd.DataFrame):
+                    setattr(target, name, val.loc[mask].reset_index(drop=True))
+                # numpy arrays
+                elif isinstance(val, np.ndarray):
+                    # 1D per-cell array
+                    if val.ndim == 1 and val.size == original_len:
+                        setattr(target, name, val[mask_arr].copy())
+                    # 2D raster that matches known grid shape -> crop window if available
+                    elif val.ndim == 2 and grid_shape is not None and val.shape == grid_shape and crop_slice is not None:
+                        # crop using original grid indices (crop_slice computed from original self.gdf)
+                        setattr(target, name, val[crop_slice].copy())
+                    else:
+                        # flatten and subset -> keep 1D per-cell array
+                        try:
+                            setattr(target, name, val.ravel()[mask_arr].copy())
+                        except Exception:
+                            # fallback: try boolean indexing if possible
+                            try:
+                                setattr(target, name, val[mask_arr].copy())
+                            except Exception:
+                                pass
+                else:
+                    # try generic indexing for sequence-like objects
+                    try:
+                        new_seq = type(val)(val[i] for i, m in enumerate(mask_arr) if m)
+                        setattr(target, name, new_seq)
+                    except Exception:
+                        # leave unchanged if cannot safely subset
+                        pass
+            else:
+                # handle full-grid 2D arrays with total size == original_len (rare)
+                if isinstance(val, np.ndarray) and val.size == original_len and val.ndim != 1:
+                    try:
+                        setattr(target, name, val.ravel()[mask_arr].copy())
+                    except Exception:
+                        pass
+                # else leave attribute untouched
+
+        # Rebuild base_layer and rows/cols from the subset bounds so transform/extent match the new object.
+        bounds = target.gdf.total_bounds  # (minx, miny, maxx, maxy)
+        # robustly read cell size (allow scalar or 2-tuple)
+        try:
+            cs = getattr(self, 'cell_size', None)
+            if cs is None:
+                raise ValueError("cell_size is not set")
+
+            # normalize cell_size into two floats
+            if isinstance(cs, (int, float, np.integer, np.floating)):
+                cell_w = cell_h = float(cs)
+            else:
+                # sequence-like: handle len == 1 or >=2
+                try:
+                    length = len(cs)
+                except Exception:
+                    # fallback: try to treat as scalar
+                    cell_w = cell_h = float(cs)
+                else:
+                    if length == 0:
+                        raise ValueError("cell_size sequence is empty")
+                    if length == 1:
+                        cell_w = cell_h = float(cs[0])
+                    else:
+                        cell_w = float(cs[0])
+                        cell_h = float(cs[1])
+
+            # prefer the model helper if available
+            if hasattr(target, '_base_layer_from_bounds') and callable(target._base_layer_from_bounds):
+                target._base_layer_from_bounds(bounds, cell_height=cell_h, cell_width=cell_w)
+            else:
+                # fallback: update a minimal base_layer/meta if present
+                if hasattr(target, 'base_layer') and target.base_layer is not None:
+                    try:
+                        height, width = RasterLayer.shape_from_cell(bounds, cell_h, cell_w)
+                        transform = rasterio.transform.from_bounds(*bounds, width, height)
+                        target.base_layer.data = np.empty((height, width))
+                        target.base_layer.data[:] = np.nan
+                        meta = dict(target.base_layer.meta or {})
+                        meta.update(width=width, height=height, transform=transform, crs=target.gdf.crs)
+                        target.base_layer.meta = meta
+                    except Exception:
+                        target.base_layer = None
+        except Exception:
+            # if anything goes wrong, ensure base_layer is at least cleared so plotting regenerates extent where possible
+            if hasattr(target, 'base_layer'):
+                try:
+                    target.base_layer = None
+                except Exception:
+                    pass
+
+        return target
