@@ -2280,12 +2280,14 @@ class OnStove(DataProcessor):
                     self.gdf.loc[self.gdf[benefit] < 0, net + '_temp'] = np.nan
         elif target == 'cost_income_ratio':
             value_cols = [col for col in self.gdf if 'cost_income_ratio_' in col]
-            benefit_cols = []  # not used here
+            benefit_cols = [col.replace('cost_income_ratio_', 'benefits_') for col in value_cols]
             result_tech = 'most_affordable_tech'
             result_value = 'most_affordable_cost_income_ratio'
             pick_func = 'min'
-            for net in value_cols:
-                self.gdf[net + '_temp'] = self.gdf[net]
+            for cost_col, ben_col in zip(value_cols, benefit_cols):
+                self.gdf[cost_col + '_temp'] = self.gdf[cost_col].copy()
+                if ben_col in self.gdf.columns:
+                    self.gdf.loc[self.gdf[ben_col] < 0, cost_col + '_temp'] = np.nan
         else:
             raise ValueError("target must be 'net_benefit' or 'cost_income_ratio'")
 
