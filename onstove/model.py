@@ -2199,7 +2199,7 @@ class OnStove(DataProcessor):
 
         print('Getting maximum net benefit technologies...')
         if isinstance(technologies, list):
-            self.maximum_net_benefit(techs, restriction=restriction, partial_access = partial_access)
+            self.maximum_net_benefit(techs, restriction=restriction, partial_access = partial_access, target=target)
         elif isinstance(technologies, dict):
             self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize)
         if target == 'net_benefit':
@@ -2237,7 +2237,8 @@ class OnStove(DataProcessor):
         columns_dict['max_benefit_tech'] = 'first'
         return columns_dict
 
-    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True, partial_access = True):
+    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True, partial_access = True,
+                            target: str = 'net_benefit'):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell.
 
         It saves the technology with highest net-benefit in the ``max_benefi_tech`` column of the :attr:`gdf`
@@ -2266,31 +2267,51 @@ class OnStove(DataProcessor):
         extract_om_costs
         extract_salvage
         """
-        net_benefit_cols = [col for col in self.gdf if 'net_benefit_' in col]
-        benefits_cols = [col for col in self.gdf if 'benefits_' in col]
-
-        for benefit, net in zip(benefits_cols, net_benefit_cols):
-            self.gdf[net + '_temp'] = self.gdf[net]
-            if restriction in [True, 'yes', 'y', 'Y', 'Yes', 'PositiveBenefits', 'Positive_Benefits']:
-                self.gdf.loc[self.gdf[benefit] < 0, net + '_temp'] = np.nan
+        if target == 'net_benefit':
+            value_cols = [col for col in self.gdf if 'net_benefit_' in col]
+            benefit_cols = [col for col in self.gdf if 'benefits_' in col]
+            result_tech = 'max_benefit_tech'
+            result_value = 'maximum_net_benefit'
+            pick_func = 'max'
+            # apply restriction only for net-benefit
+            for benefit, net in zip(benefit_cols, value_cols):
+                self.gdf[net + '_temp'] = self.gdf[net]
+                if restriction in [True, 'yes', 'y', 'Y', 'Yes', 'PositiveBenefits', 'Positive_Benefits']:
+                    self.gdf.loc[self.gdf[benefit] < 0, net + '_temp'] = np.nan
+        elif target == 'cost_income_ratio':
+            value_cols = [col for col in self.gdf if 'cost_income_ratio_' in col]
+            benefit_cols = []  # not used here
+            result_tech = 'most_affordable_tech'
+            result_value = 'most_affordable_cost_income_ratio'
+            pick_func = 'min'
+            for net in value_cols:
+                self.gdf[net + '_temp'] = self.gdf[net]
+        else:
+            raise ValueError("target must be 'net_benefit' or 'cost_income_ratio'")
 
         temps = [col for col in self.gdf if '_temp' in col]
-        self.gdf["max_benefit_tech"] = self.gdf[temps].idxmax(axis=1).astype('string')
+        if pick_func == 'max':
+            self.gdf[result_tech] = self.gdf[temps].idxmax(axis=1).astype('string')
+            self.gdf[result_value] = self.gdf[temps].max(axis=1)
+        else:  # min
+            self.gdf[result_tech] = self.gdf[temps].idxmin(axis=1).astype('string')
+            self.gdf[result_value] = self.gdf[temps].min(axis=1)
 
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
-        self.gdf["maximum_net_benefit"] = self.gdf[temps].max(axis=1)
+        self.gdf[result_tech] = self.gdf[result_tech].str.replace("net_benefit_", "").str.replace("cost_income_ratio_", "").str.replace("_temp", "")
 
+        # Partial access adjustment only meaningful for net-benefit
+        if target != 'net_benefit':
+            return
         if partial_access:
+            # ...existing partial_access block remains unchanged...
+            # (uses benefit/net columns; safe only for net_benefit target)
             gdf = gpd.GeoDataFrame()
             gdf_copy = self.gdf.copy()
-            # TODO: Change this to a while loop that checks the sum of number of households supplied against the total hhs
             for tech in techs:
                 current = (tech.households < gdf_copy['Households']) & \
-                          (gdf_copy["max_benefit_tech"] == tech.name)
+                          (gdf_copy[result_tech] == tech.name)
                 dff = gdf_copy.loc[current].copy()
                 if current.sum() > 0:
-                    # dff.loc[current, "maximum_net_benefit"] *= tech.factor.loc[current]
                     dff.loc[current, f'net_benefit_{tech.name}_temp'] = np.nan
 
                     second_benefit_cols = temps.copy()
@@ -2302,11 +2323,11 @@ class OnStove(DataProcessor):
                     second_best = second_best.str.replace("_temp", "")
                     second_best.replace('NaN', np.nan, inplace=True)
 
-                    second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1) #* (1 - tech.factor.loc[current])
+                    second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1)
 
                     elec_factor = dff['Elec_pop_calib'] / dff['Calibrated_pop']
-                    dff['max_benefit_tech'] = second_best
-                    dff['maximum_net_benefit'] = second_tech_net_benefit
+                    dff[result_tech] = second_best
+                    dff[result_value] = second_tech_net_benefit
                     dff['Calibrated_pop'] *= (1 - tech.factor.loc[current])
                     dff['Households'] *= (1 - tech.factor.loc[current])
 
@@ -2314,7 +2335,6 @@ class OnStove(DataProcessor):
                     self.gdf.loc[current, 'Households'] *= tech.factor.loc[current]
                     if tech.name == 'Electricity':
                         dff['Elec_pop_calib'] *= 0
-                    #     self.gdf.loc[current, 'Elec_pop_calib'] *= tech.factor.loc[current]
                     else:
                         self.gdf.loc[current, 'Elec_pop_calib'] = self.gdf.loc[current, 'Calibrated_pop'] * elec_factor
                         dff['Elec_pop_calib'] = dff['Calibrated_pop'] * elec_factor
@@ -2322,22 +2342,21 @@ class OnStove(DataProcessor):
 
             self.gdf = pd.concat([self.gdf, gdf])
 
-            for net in net_benefit_cols:
+            for net in value_cols:
                 self.gdf[net + '_temp'] = self.gdf[net]
 
             temps = [col for col in self.gdf if 'temp' in col]
 
-            for tech in self.gdf["max_benefit_tech"].unique():
-                index = self.gdf.loc[self.gdf['max_benefit_tech'] == tech].index
+            for tech in self.gdf[result_tech].unique():
+                index = self.gdf.loc[self.gdf[result_tech] == tech].index
                 self.gdf.loc[index, f'net_benefit_{tech}_temp'] = np.nan
 
-            isna = self.gdf["max_benefit_tech"].isna()
+            isna = self.gdf[result_tech].isna()
 
             if isna.sum() > 0:
-                self.gdf.loc[isna, 'max_benefit_tech'] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
-            self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
-            self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
-            self.gdf.loc[isna, "maximum_net_benefit"] = self.gdf.loc[isna, temps].max(axis=1)
+                self.gdf.loc[isna, result_tech] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
+            self.gdf[result_tech] = self.gdf[result_tech].str.replace("net_benefit_", "").str.replace("_temp", "")
+            self.gdf.loc[isna, result_value] = self.gdf.loc[isna, temps].max(axis=1)
 
     # TODO: check if we need this method
 
