@@ -2301,6 +2301,14 @@ class OnStove(DataProcessor):
 
         self.gdf[result_tech] = self.gdf[result_tech].str.replace("net_benefit_", "").str.replace("cost_income_ratio_", "").str.replace("_temp", "")
 
+        if target == 'cost_income_ratio':
+            self.gdf['maximum_net_benefit'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                mask = self.gdf[result_tech] == tech_name
+                net_ben_col = f'net_benefit_{tech_name}'
+                if net_ben_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+
         # Partial access adjustment only meaningful for net-benefit
         if target != 'net_benefit':
             return
@@ -2575,6 +2583,16 @@ class OnStove(DataProcessor):
             self.gdf.loc[assigned_ids, 'technology_option'] = i
             print('Final shares after clearing None assignments ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
             
+        if target == 'cost_income_ratio':
+            self.gdf['maximum_net_benefit'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[result_tech] == tech_name
+                net_ben_col = f'net_benefit_{tech_name}'
+                if net_ben_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+
 
     def _add_admin_names(self, admin, column_name):
         if isinstance(admin, str):
