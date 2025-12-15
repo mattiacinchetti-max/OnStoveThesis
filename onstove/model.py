@@ -2104,7 +2104,8 @@ class OnStove(DataProcessor):
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
     def run(self, technologies: Optional[Union[list, dict, str]] = 'all', restriction: bool = True, prioritize: bool = True,
-            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False):
+            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False,
+            tech_groups: Optional[dict[str, list[str]]] = None):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
         It loops through the ``technologies`` and calculates all costs, benefit and the net-benefit of cooking with
@@ -2139,6 +2140,11 @@ class OnStove(DataProcessor):
         target: str, default 'net_benefit'
             Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
             'cost_income_ratio'.
+
+        tech_groups: dict[str, list[str]], optional
+            Optional dictionary mapping group names to lists of technology names. If a share key is a group,
+            the share is treated as a single competitive pool among the group's technologies, assigned by
+            the selected target metric (idxmax/idxmin) without equal pre-splitting.
 
         See also
         --------
@@ -2178,6 +2184,17 @@ class OnStove(DataProcessor):
             for shares in technologies.values():
                 techs.update(shares.keys())
             print(techs)
+            # Expand technology groups into individual technology names
+            if tech_groups is not None:
+                expanded_techs = set()
+                for tech_name in techs:
+                    if tech_name in tech_groups:
+                        # This is a group name, expand it to individual technologies
+                        expanded_techs.update(tech_groups[tech_name])
+                    else:
+                        # This is an individual technology name
+                        expanded_techs.add(tech_name)
+                techs = expanded_techs
             techs = [self.techs[name] for name in techs]
         for tech in techs:
             print(f'Calculating health benefits for {tech.name}...')
@@ -2206,7 +2223,7 @@ class OnStove(DataProcessor):
         if isinstance(technologies, list):
             self.maximum_net_benefit(techs, restriction=restriction, partial_access = partial_access, target=target)
         elif isinstance(technologies, dict):
-            self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize)
+            self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize, tech_groups=tech_groups)
         if target == 'net_benefit':
             column = 'max_benefit_tech'
         elif target == 'cost_income_ratio':
@@ -2232,6 +2249,30 @@ class OnStove(DataProcessor):
         self.extract_om_costs(column=column)
         print('    - Salvage value')
         self.extract_salvage(column=column)
+        
+        # Create affordability columns for the selected technology
+        if 'absolute_wealth' in self.gdf.columns or 'income' in self.gdf.columns:
+            print('    - Affordability for selected technologies')
+            # Initialize columns
+            self.gdf[f'affordability_category_{column}'] = None
+            self.gdf[f'affordability_support_required_{column}'] = np.nan
+            
+            # Populate from tech-specific columns based on selected tech
+            for tech_name in self.gdf[column].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[column] == tech_name
+                
+                # Copy affordability category if it exists
+                cat_col = f'affordability_category_{tech_name}'
+                if cat_col in self.gdf.columns:
+                    self.gdf.loc[mask, f'affordability_category_{column}'] = self.gdf.loc[mask, cat_col]
+                
+                # Copy affordability support required if it exists
+                support_col = f'affordability_support_required_{tech_name}'
+                if support_col in self.gdf.columns:
+                    self.gdf.loc[mask, f'affordability_support_required_{column}'] = self.gdf.loc[mask, support_col]
+        
         print('Done')
 
     # TODO: check if this function is still needed
@@ -2313,6 +2354,13 @@ class OnStove(DataProcessor):
                 net_ben_col = f'net_benefit_{tech_name}'
                 if net_ben_col in self.gdf.columns:
                     self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+        elif target == 'net_benefit':
+            self.gdf['most_affordable_cost_income_ratio'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                mask = self.gdf[result_tech] == tech_name
+                cost_ratio_col = f'cost_income_ratio_{tech_name}'
+                if cost_ratio_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'most_affordable_cost_income_ratio'] = self.gdf.loc[mask, cost_ratio_col]
 
         # Partial access adjustment only meaningful for net-benefit
         if target != 'net_benefit':
@@ -2375,8 +2423,9 @@ class OnStove(DataProcessor):
 
     # TODO: check if we need this method
 
-    def stove_share_assignment(self, techs: dict[str:dict[str:float]], target: str = 'net_benefit', 
-                               restriction: bool = True, prioritize: bool = True, clear_none: bool = True):
+    def stove_share_assignment(self, techs: dict[str,dict[str,float]], target: str = 'net_benefit', 
+                               restriction: bool = True, prioritize: bool = True, clear_none: bool = True,
+                               tech_groups: Optional[dict[str, list[str]]] = None):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell
         while achieving user defined shares.
 
@@ -2386,7 +2435,11 @@ class OnStove(DataProcessor):
         Parameters
         ----------
         techs: dict of str:float
-            Dictionary with technology names as keys and their user defined share as values.
+            Dictionary with technology names or group names as keys and their user defined share as values.
+        tech_groups: dict[str, list[str]], optional
+            Optional dictionary mapping group names to lists of technology names. If a share key is a group,
+            the share is treated as a single competitive pool among the group's technologies, assigned by
+            the selected target metric (idxmax/idxmin) without equal pre-splitting.
         target: str, default 'net_benefit'
             Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
             'cost_income_ratio'.
@@ -2408,7 +2461,7 @@ class OnStove(DataProcessor):
         extract_om_costs
         extract_salvage
 
-        """
+        """      
         if target == 'net_benefit':
             net_benefit_cols = [col for col in self.gdf if 'net_benefit_' in col]
             benefits_cols = [col for col in self.gdf if 'benefits_' in col]
@@ -2421,6 +2474,12 @@ class OnStove(DataProcessor):
             result_value = 'maximum_net_benefit'
 
         elif target == 'cost_income_ratio':
+            value_cols = [col for col in self.gdf if 'cost_income_ratio_' in col]
+            benefit_cols = [col.replace('cost_income_ratio_', 'benefits_') for col in value_cols]
+            for cost_col, ben_col in zip(value_cols, benefit_cols):
+                if ben_col in self.gdf.columns:
+                    self.gdf.loc[self.gdf[ben_col] < 0, cost_col] = np.nan
+
             result_tech = 'most_affordable_tech'
             result_value = 'most_affordable_cost_income_ratio'
 
@@ -2439,6 +2498,67 @@ class OnStove(DataProcessor):
             self.gdf.loc[isurban, result_tech] = None
             self.gdf.loc[isurban, result_value] = None
             self.gdf.loc[isurban, 'technology_option'] = None
+
+            # First, handle group shares competitively (no equal split): assign best within-group until group target is met
+            if tech_groups:
+                group_targets = {k: v for k, v in tech_target_pop.items() if k in tech_groups}
+                for group_name, group_target in group_targets.items():
+                    if group_target <= 0:
+                        continue
+                    group_cols = [f"{target}_{t}" for t in tech_groups[group_name] if f"{target}_{t}" in self.gdf.columns]
+                    if len(group_cols) == 0:
+                        # No valid target columns found for this group
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    # Available cells for assignment
+                    condition = self.gdf.loc[isurban, result_tech].isna()
+                    available_cells = self.gdf.loc[condition & isurban].copy()
+                    if len(available_cells) == 0:
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    # Pick winning tech per cell within the group based on target metric
+                    if target == 'net_benefit':
+                        available_cells[result_tech] = available_cells[group_cols].idxmax(axis=1).astype('string')
+                        available_cells[result_value] = available_cells[group_cols].max(axis=1)
+                        sort_ascending = False
+                    else:  # cost_income_ratio
+                        available_cells[result_tech] = available_cells[group_cols].idxmin(axis=1).astype('string')
+                        available_cells[result_value] = available_cells[group_cols].min(axis=1)
+                        sort_ascending = False
+                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+
+                    # Consider only rows where winner is in the group
+                    candidates = available_cells[available_cells[result_tech].isin(tech_groups[group_name])]
+                    if len(candidates) == 0:
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    candidates = candidates.sort_values(result_value, ascending=sort_ascending)
+                    candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                    assigned = candidates[candidates['cummulative_pop'] <= group_target]
+                    if candidates['Calibrated_pop'].sum() > group_target and len(candidates) > len(assigned):
+                        assigned = pd.concat([assigned, candidates.iloc[[len(assigned)]]])
+
+                    assigned_ids = assigned.index.to_list()
+                    assigned_pop = assigned['Calibrated_pop'].sum()
+
+                    # Assign each row to its winning tech within the group
+                    self.gdf.loc[assigned_ids, result_tech] = assigned[result_tech]
+                    self.gdf.loc[assigned_ids, result_value] = assigned[result_value]
+                    self.gdf.loc[assigned_ids, 'technology_option'] = 1
+                    unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)]
+                    tech_target_pop[group_name] -= assigned_pop
+                    # remove consumed group share from unassigned dict so tech-level loop ignores group key
+                    if tech_target_pop[group_name] <= 0:
+                        tech_target_pop[group_name] = -999
+
+                # Clean up invalid group entries
+                tech_target_pop_unassigned = {k: v for k, v in tech_target_pop.items() if v > 0 and k not in (tech_groups or {}).keys()}
+            else:
+                tech_target_pop_unassigned = tech_target_pop.copy()
 
             if prioritize:
                 print(f'Prioritizing technology shares in {region} areas.\n')
@@ -2542,7 +2662,7 @@ class OnStove(DataProcessor):
                     if target == 'net_benefit':
                         candidates = candidates.sort_values(result_value, ascending=False)
                     elif target == 'cost_income_ratio':
-                        candidates = candidates.sort_values(result_value, ascending=True) # ascending = True, depends on the question being asked regarding affordability.
+                        candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
                     candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
 
                     assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
@@ -2597,6 +2717,15 @@ class OnStove(DataProcessor):
                 net_ben_col = f'net_benefit_{tech_name}'
                 if net_ben_col in self.gdf.columns:
                     self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+        elif target == 'net_benefit':
+            self.gdf['most_affordable_cost_income_ratio'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[result_tech] == tech_name
+                cost_ratio_col = f'cost_income_ratio_{tech_name}'
+                if cost_ratio_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'most_affordable_cost_income_ratio'] = self.gdf.loc[mask, cost_ratio_col]
 
 
     def _add_admin_names(self, admin, column_name):
@@ -3261,6 +3390,8 @@ class OnStove(DataProcessor):
              legend: bool = True, legend_title: str = '', legend_cols: int = 1,
              legend_position: tuple[float, float] = (1.02, 0.6),
              legend_prop: Optional[dict] = None,
+             colorbar: bool = True,
+             colorbar_kwargs: Optional[dict] = None,
              stats: bool = False,
              stats_kwargs: Optional[dict] = None,
              scale_bar: Optional[dict] = None, north_arrow: Optional[dict] = None,
@@ -3482,7 +3613,8 @@ class OnStove(DataProcessor):
                          categories=codes, legend_position=legend_position,
                          admin_layer=admin_layer, title=title, legend=legend,
                          legend_title=legend_title, legend_cols=legend_cols, rasterized=rasterized,
-                         ax=ax, legend_prop=legend_prop, scale_bar=scale_bar, north_arrow=north_arrow)
+                         ax=ax, legend_prop=legend_prop, colorbar=colorbar, 
+                         colorbar_kwargs=colorbar_kwargs, scale_bar=scale_bar, north_arrow=north_arrow)
 
         if save_style:
             if codes:
@@ -4476,7 +4608,8 @@ class OnStove(DataProcessor):
         
         variable = f'affordability_category_{fuel}'
 
-        categories = list(self.techs[fuel].categories or [])
+        # Read categories from any tech object (all have identical categories)
+        categories = list(next(iter(self.techs.values())).categories or [])
         if 'Not available' not in categories:
             categories.append('Not available')
 
