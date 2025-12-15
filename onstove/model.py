@@ -1511,7 +1511,7 @@ class OnStove(DataProcessor):
         
         # Spatial join baseline_map to self.gdf
         self.gdf = gpd.sjoin(self.gdf, baseline_map[list(column_map.keys()) + ['geometry']], 
-                            how='left', predicate='intersects')
+                            how='left', predicate='intersects')        
         
         # Find cells without matches (where index_right is NaN)
         unmatched_mask = self.gdf['index_right'].isna()
@@ -1549,9 +1549,14 @@ class OnStove(DataProcessor):
             else:
                 raise KeyError(f"Technology {tech_name} not found in model technologies.")
             base_fuels[tech_name] = self.techs[tech_name]
+
+        # Ensure all technologies in the model have a pop_sqkm Series.
+        # Technologies not present in the baseline_map get zeros.
+        for tech_name, tech in self.techs.items():
+            if tech_name not in base_fuels:
+                tech.pop_sqkm = pd.Series(0.0, index=self.gdf.index)
         
-        return base_fuels    
-        
+        return base_fuels        
     
     def set_base_fuel(
             self,
