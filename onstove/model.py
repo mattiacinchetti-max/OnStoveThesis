@@ -2693,18 +2693,32 @@ class OnStove(DataProcessor):
 
         if clear_none:
             print(f'\nClearing None assignments by assigning the best available technology for the {target} target.')
-            are_none = self.gdf[self.gdf[result_tech] == 'None']
+            are_none = self.gdf[self.gdf[result_tech] == 'None'].copy()
+            value_cols = [col for col in self.gdf.columns if col.startswith(f'{target}_')]
+            
+            # Get corresponding net_benefit columns to check for positive values
+            net_benefit_cols = [col.replace('cost_income_ratio_', 'net_benefit_') if 'cost_income_ratio_' in col else col 
+                               for col in value_cols]
+            
+            # Only consider technologies where net_benefit > 0 (restrictions already set NaN for negative benefits earlier)
+            # Additional filter: explicitly check net_benefit > 0
+            for val_col, net_col in zip(value_cols, net_benefit_cols):
+                if net_col in self.gdf.columns:
+                    # Set to NaN where net_benefit is not positive (includes NaN and <=0)
+                    are_none.loc[~(are_none[net_col] > 0), val_col] = np.nan
+            
             if target == 'net_benefit':
-                are_none[result_tech] = are_none[cols].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
-                are_none[result_value] = are_none[cols].max(axis=1) # Gets the maximum net benefit for the available cells.
+                are_none[result_tech] = are_none[value_cols].idxmax(axis=1).astype('string')
+                are_none[result_value] = are_none[value_cols].max(axis=1)
             elif target == 'cost_income_ratio':
-                are_none[result_tech] = are_none[cols].idxmin(axis=1).astype('string')
-                are_none[result_value] = are_none[cols].min(axis=1)
+                are_none[result_tech] = are_none[value_cols].idxmin(axis=1).astype('string')
+                are_none[result_value] = are_none[value_cols].min(axis=1)
+            
             are_none[result_tech] = are_none[result_tech].str.replace(f"{target}_", "")
 
-            assigned_ids = are_none.index.to_list() # Gets the ids of the assigned candidates.
-            self.gdf.loc[assigned_ids, result_tech] = tech # Assigns the technology to the assigned candidates.
-            self.gdf.loc[assigned_ids, result_value] = assigned[result_value] # Assigns the maximum net benefit to the assigned candidates.
+            assigned_ids = are_none.index.to_list()
+            self.gdf.loc[assigned_ids, result_tech] = are_none[result_tech].values
+            self.gdf.loc[assigned_ids, result_value] = are_none[result_value].values
             self.gdf.loc[assigned_ids, 'technology_option'] = i
             print('Final shares after clearing None assignments ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
             
