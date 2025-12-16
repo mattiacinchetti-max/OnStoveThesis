@@ -4616,66 +4616,95 @@ class OnStove(DataProcessor):
                            ax: Optional['matplotlib.axes.Axes'] = None,
                            bar_variable: str = 'Households',
                            categories: list = [],
-                           colors: list = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey'],
-                           dpi: float = 150, save_as: Optional[str] = None) -> matplotlib.axes.Axes:
+                           colors: list = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey', '#5a5a5a'],
+                           dpi: float = 150, save_as: Optional[str] = None, filter_allocated: bool = False,
+                           allocation_column: str = None) -> matplotlib.axes.Axes:
         """Expands map plotting function specifically for affordability maps."""
-        
         variable = f'affordability_category_{fuel}'
+        original_series = self.gdf[variable].copy()
+        try:
+            working_series = original_series.copy()
 
-        # Read categories from any tech object (all have identical categories)
-        categories = list(next(iter(self.techs.values())).categories or [])
-        if 'Not available' not in categories:
-            categories.append('Not available')
+            if filter_allocated:
+                if allocation_column is None:
+                    if 'most_affordable_tech' in self.gdf.columns:
+                        allocation_column = 'most_affordable_tech'
+                    elif 'max_benefit_tech' in self.gdf.columns:
+                        allocation_column = 'max_benefit_tech'
+                    else:
+                        raise ValueError("Could not find allocation column. Please specify allocation_column parameter.")
 
-        if not colors:
-            colors = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey']
-        grad_colors = colors[:-1]            # green→red palette
-        grey = colors[-1]
-        n_grad = max(len(categories) - 1, 0)
-        if n_grad == 0:
-            colors_use = [grey]
-        else:
-            grad_cmap = LinearSegmentedColormap.from_list('aff_grad', grad_colors)
-            colors_use = [to_hex(grad_cmap(v)) for v in np.linspace(0, 1, n_grad)]
-            colors_use.append(grey)
+                # Ensure 'Not allocated' exists in categorical series before assignment
+                if pd.api.types.is_categorical_dtype(working_series) and 'Not allocated' not in working_series.cat.categories:
+                    working_series = working_series.cat.add_categories(['Not allocated'])
 
-        cmap = {cat: col for cat, col in zip(categories, colors_use)}
-        category_color_map = cmap
+                not_allocated_mask = self.gdf[allocation_column] != fuel
+                numeric_mask = working_series.notna() & (working_series.astype(str) != 'Not available')
+                working_series.loc[not_allocated_mask & numeric_mask] = 'Not allocated'
 
-        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+            base_categories = list(next(iter(self.techs.values())).categories or [])
+            grad_categories = [c for c in base_categories if c not in ('Not available', 'Not allocated')]
+            categories = grad_categories + ['Not available'] + (['Not allocated'] if filter_allocated else [])
 
-        self.plot(variable, cmap=cmap, ax=ax, title=title,
-                  figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
-                  legend_position=(-0.25, 1.05),
-                  legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
-                  stats=False, rasterized=True, dpi=300)
+            if pd.api.types.is_categorical_dtype(working_series):
+                working_series = working_series.astype('category')
+                needed = [c for c in categories if c not in working_series.cat.categories]
+                if needed:
+                    working_series = working_series.cat.add_categories(needed)
+            self.gdf[variable] = working_series
 
-        counts = self.gdf.groupby(variable, observed=False)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
-        counts = counts.reindex(categories).fillna(0)
-        labels = counts.index
-        values = counts.values
-        bar_colors = [category_color_map[label] for label in labels]
+            # Build color map: gradient across numeric categories; greys for statuses
+            if not colors:
+                colors = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424']
+            # filter out greys in case they were included
+            grad_base = [c for c in colors if str(c).lower() not in ['grey', '#808080', '#5a5a5a']]
+            if len(grad_base) < 2:
+                grad_base = ['#51a655', '#f02424']
+            grad_cmap = LinearSegmentedColormap.from_list('aff_grad', grad_base)
+            n_grad = max(len(grad_categories), 1)
+            grad_color_list = [to_hex(grad_cmap(v)) for v in np.linspace(0, 1, n_grad)]
 
-        axins = inset_axes(ax, width="20%", height="20%", loc='lower left', borderpad=1.5)
-        bars = axins.bar(labels, values, color=bar_colors, edgecolor='black')
-        axins.set_title(f'{bar_variable} share', fontsize=8)
-        axins.set_ylim(0, 1)
-        axins.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
-        axins.tick_params(axis='x', labelrotation=45, labelsize=7)
-        axins.tick_params(axis='y', labelsize=7)
+            cmap = {cat: col for cat, col in zip(grad_categories, grad_color_list)}
+            cmap['Not available'] = '#b0b0b0'  # lighter grey for availability status
+            if filter_allocated:
+                cmap['Not allocated'] = '#5a5a5a'  # darker grey for non-allocated
+            category_color_map = cmap
 
-        for bar in bars:
-            yval = bar.get_height()
-            axins.text(bar.get_x() + bar.get_width()/2, yval + 0.025, f"{yval:.0%}",
-                       ha='center', fontsize=6)
+            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
-        if isinstance(save_as, str):
-            path = os.path.join(self.output_directory, 'Cost_income')
-            os.makedirs(path, exist_ok=True)
-            plt.savefig(os.path.join(path, save_as), dpi=dpi, bbox_inches='tight', transparent=True)
+            self.plot(variable, cmap=cmap, ax=ax, title=title,
+                      figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
+                      legend_position=(-0.25, 1.05),
+                      legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
+                      stats=False, rasterized=True, dpi=300)
+
+            counts = self.gdf.groupby(variable, observed=False)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
+            counts = counts.reindex(categories).fillna(0)
+            labels = counts.index
+            values = counts.values
+            bar_colors = [category_color_map[label] for label in labels]
+
+            axins = inset_axes(ax, width="20%", height="20%", loc='lower left', borderpad=1.5)
+            bars = axins.bar(labels, values, color=bar_colors, edgecolor='black')
+            axins.set_title(f'{bar_variable} share', fontsize=8)
+            axins.set_ylim(0, 1)
+            axins.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
+            axins.tick_params(axis='x', labelrotation=45, labelsize=7)
+            axins.tick_params(axis='y', labelsize=7)
+
+            for bar in bars:
+                yval = bar.get_height()
+                axins.text(bar.get_x() + bar.get_width()/2, yval + 0.025, f"{yval:.0%}",
+                           ha='center', fontsize=6)
+
+            if isinstance(save_as, str):
+                path = os.path.join(self.output_directory, 'Cost_income')
+                os.makedirs(path, exist_ok=True)
+                plt.savefig(os.path.join(path, save_as), dpi=dpi, bbox_inches='tight', transparent=True)
+        finally:
+            self.gdf[variable] = original_series
 
         return ax
-
     
     def to_csv(self, name: str):
         """Saves the main GeoDataFrame :attr:`gdf` as a ``.csv`` file into the :attr:`output_directory`.
