@@ -27,7 +27,7 @@ def align_raster(raster_1, raster_2, method='nearest', nodata='raster2', compres
     if nodata == 'raster2':
         nodata = raster_2_meta['nodata']
     else:
-        nodata = raster_1meta['nodata']
+        nodata = raster_1_meta['nodata']
     reproject(
         source=raster_2.data,
         destination=destination,
