@@ -934,7 +934,6 @@ class RasterLayer(_Layer):
                                      compress='DEFLATE')
                 else:
                     self.data = src.read(band)
-                    self.data = src.read(band)
                     self.meta = src.meta
 
             if self.meta['nodata'] is None:
