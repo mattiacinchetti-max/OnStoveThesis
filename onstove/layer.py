@@ -647,7 +647,6 @@ class VectorLayer(_Layer):
             return 'Line'
         else:
             return 'Generic'
-        return 
     
     @property
     def style(self) -> dict:
