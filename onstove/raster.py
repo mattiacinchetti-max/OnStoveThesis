@@ -11,7 +11,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.enums import Resampling as enumsResampling
 
 
-def align_raster(raster_1, raster_2, method='nearest', compression='DEFLATE'):
+def align_raster(raster_1, raster_2, method='nearest', nodata='raster2', compression='DEFLATE'):
     raster_1_meta = raster_1.meta
     raster_2_meta = raster_2.meta
 
@@ -24,12 +24,16 @@ def align_raster(raster_1, raster_2, method='nearest', compression='DEFLATE'):
         'dtype': raster_2_meta['dtype']
     })
     destination = np.full((raster_1_meta['height'], raster_1_meta['width']), raster_2_meta['nodata'])
+    if nodata == 'raster2':
+        nodata = raster_2_meta['nodata']
+    else:
+        nodata = raster_1_meta['nodata']
     reproject(
         source=raster_2.data,
         destination=destination,
         src_transform=raster_2_meta['transform'],
         src_crs=raster_2_meta['crs'],
-        src_nodata=raster_2_meta['nodata'],
+        src_nodata=nodata,
         dst_transform=raster_1_meta['transform'],
         dst_crs=raster_1_meta['crs'],
         resampling=Resampling[method])
@@ -80,64 +84,64 @@ def align_raster(raster_1, raster_2, method='nearest', compression='DEFLATE'):
     #     dest.write(out_image)
 
 
-def reproject_raster(raster_path, dst_crs,
-                     cell_width=None, cell_height=None, method='nearest',
-                     compression='DEFLATE'):
-    """
-    Resamples and/or reproject a raster layer.
-    """
-    with rasterio.open(raster_path) as src:
-        # Calculates the new transform, widht and height of 
-        # the reprojected layer
-        transform, width, height = calculate_default_transform(
-            src.crs, dst_crs,
-            src.width,
-            src.height,
-            *src.bounds)
-        # If a destination cell width and height was provided, then it 
-        # calculates the new boundaries, with, heigh and transform 
-        # depending on the new cell size.
-        if cell_width and cell_height:
-            bounds = rasterio.transform.array_bounds(height, width, transform)
-            width = int(width * (transform[0] / cell_width))
-            height = int(height * (abs(transform[4]) / cell_height))
-            transform = rasterio.transform.from_origin(bounds[0], bounds[3],
-                                                       cell_width, cell_height)
-        # Updates the metadata
-        out_meta = src.meta.copy()
-        out_meta.update({
-            'crs': dst_crs,
-            'transform': transform,
-            'width': width,
-            'height': height,
-            'compress': compression
-        })
-        # The layer is then reprojected/resampled
-        # if output_file:
-        #     # if an output file path was provided, then the layer is saved
-        #     with rasterio.open(output_file, 'w', **out_meta) as dst:
-        #         for i in range(1, src.count + 1):
-        #             reproject(
-        #                 source=rasterio.band(src, i),
-        #                 destination=rasterio.band(dst, i),
-        #                 src_transform=src.transform,
-        #                 src_crs=src.crs,
-        #                 dst_transform=transform,
-        #                 dst_crs=dst_crs,
-        #                 resampling=Resampling[method])
-        # else:
-            # If not outputfile is provided, then a numpy array and the 
-            # metadata if returned
-        destination = np.full((height, width), src.nodata)
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=destination,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=transform,
-            dst_crs=dst_crs,
-            resampling=Resampling[method])
-        return destination, out_meta
+# def reproject_raster(raster_path, dst_crs,
+#                      cell_width=None, cell_height=None, method='nearest',
+#                      compression='DEFLATE'):
+#     """
+#     Resamples and/or reproject a raster layer.
+#     """
+#     with rasterio.open(raster_path) as src:
+#         # Calculates the new transform, widht and height of
+#         # the reprojected layer
+#         transform, width, height = calculate_default_transform(
+#             src.crs, dst_crs,
+#             src.width,
+#             src.height,
+#             *src.bounds)
+#         # If a destination cell width and height was provided, then it
+#         # calculates the new boundaries, with, heigh and transform
+#         # depending on the new cell size.
+#         if cell_width and cell_height:
+#             bounds = rasterio.transform.array_bounds(height, width, transform)
+#             width = int(width * (transform[0] / cell_width))
+#             height = int(height * (abs(transform[4]) / cell_height))
+#             transform = rasterio.transform.from_origin(bounds[0], bounds[3],
+#                                                        cell_width, cell_height)
+#         # Updates the metadata
+#         out_meta = src.meta.copy()
+#         out_meta.update({
+#             'crs': dst_crs,
+#             'transform': transform,
+#             'width': width,
+#             'height': height,
+#             'compress': compression
+#         })
+#         # The layer is then reprojected/resampled
+#         # if output_file:
+#         #     # if an output file path was provided, then the layer is saved
+#         #     with rasterio.open(output_file, 'w', **out_meta) as dst:
+#         #         for i in range(1, src.count + 1):
+#         #             reproject(
+#         #                 source=rasterio.band(src, i),
+#         #                 destination=rasterio.band(dst, i),
+#         #                 src_transform=src.transform,
+#         #                 src_crs=src.crs,
+#         #                 dst_transform=transform,
+#         #                 dst_crs=dst_crs,
+#         #                 resampling=Resampling[method])
+#         # else:
+#             # If not outputfile is provided, then a numpy array and the
+#             # metadata if returned
+#         destination = np.full((height, width), src.nodata)
+#         reproject(
+#             source=rasterio.band(src, 1),
+#             destination=destination,
+#             src_transform=src.transform,
+#             src_crs=src.crs,
+#             dst_transform=transform,
+#             dst_crs=dst_crs,
+#             resampling=Resampling[method])
+#         return destination, out_meta
 
 
 def sample_raster(path, gdf):

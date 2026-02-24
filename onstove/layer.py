@@ -596,7 +596,7 @@ class VectorLayer(_Layer):
 
         return row_list, col_list
 
-    def save(self, output_path: str, name: str = None):
+    def save(self, output_path: str, name: str = None, type: str = 'geojson', append_subdataset: bool = False):
         """Saves the current :class:`VectorLayer` into disk.
 
         It saves the layer in the ``output_path`` defined using the ``name`` attribute as filename and `geojson` as
@@ -615,9 +615,16 @@ class VectorLayer(_Layer):
         if not isinstance(name, str):
             name = self.name
         output_file = os.path.join(output_path,
-                                   name + '.geojson')
+                                   name + f'.{type}')
         os.makedirs(output_path, exist_ok=True)
-        self.data.to_file(output_file, driver='GeoJSON')
+        if type == 'geojson':
+            self.data.to_file(output_file, driver='GeoJSON')
+        elif type == 'gpkg':
+            if append_subdataset:
+                self.data.to_file(output_file, layer=self.name, driver='GPKG', mode='a')
+            else:
+                self.data.to_file(output_file, layer=self.name, driver='GPKG')
+
         self.path = output_file
 
     def _add_restricted_areas(self, layer_path, layer_type, **kwargs):
@@ -640,7 +647,6 @@ class VectorLayer(_Layer):
             return 'Line'
         else:
             return 'Generic'
-        return 
     
     @property
     def style(self) -> dict:
@@ -856,7 +862,7 @@ class RasterLayer(_Layer):
                  normalization: Optional[str] = 'MinMax', inverse: bool = False,
                  distance_method:  Optional[str] = None,
                  distance_limit: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-                 resample: str = 'nearest', window: Optional[windows.Window] = None,
+                 resample: str = 'nearest', band=1, window: Optional[windows.Window] = None,
                  rescale: bool = False):
         """
         Initializes the class with user defined or default parameters.
@@ -871,7 +877,7 @@ class RasterLayer(_Layer):
                          normalization=normalization, inverse=inverse,
                          distance_method=distance_method,
                          distance_limit=distance_limit)
-        self.read_layer(path, conn, window=window)
+        self.read_layer(path, conn, band=band, window=window)
 
     def __repr__(self):
         return 'Raster' + super().__repr__()
@@ -888,7 +894,7 @@ class RasterLayer(_Layer):
                                       self.meta['width'],
                                       self.meta['transform'])
 
-    def read_layer(self, path, conn=None, window=None):
+    def read_layer(self, path, conn=None, band=1, window=None):
         """Reads a dataset from a GIS raster data file.
 
         It works as a wrapper method that uses :doc:`rasterio.open()<rasterio:index>` to read raster data and
@@ -920,12 +926,13 @@ class RasterLayer(_Layer):
                     self.meta = src.meta.copy()
                     window = windows.from_bounds(*window, transform=transform)
                     window_transform = src.window_transform(window)
-                    self.data = src.read(1, window=window)
+                    self.data = src.read(band, window=window)
+                    self.data = src.read(band, window=window)
                     self.meta.update(transform=window_transform,
                                      width=self.data.shape[1], height=self.data.shape[0],
                                      compress='DEFLATE')
                 else:
-                    self.data = src.read(1)
+                    self.data = src.read(band)
                     self.meta = src.meta
 
             if self.meta['nodata'] is None:
@@ -1038,7 +1045,8 @@ class RasterLayer(_Layer):
             self.save(output_path)
 
     def reproject(self, crs: rasterio.crs.CRS, output_path: Optional[str] = None,
-                  cell_width: Optional[float] = None, cell_height: Optional[float] = None):
+                  cell_width: Optional[float] = None, cell_height: Optional[float] = None,
+                  method: str = 'nearest'):
         """Reprojects the raster data into a specified coordinate system.
 
         Uses the :doc:`rasterio.features.rasterize<rasterio:api/rasterio.features>` function to reproject the current
@@ -1058,13 +1066,46 @@ class RasterLayer(_Layer):
         cell_height: float, optional
             The cell height in units consistent with the raster's crs. If provided the transform of the raster will be
             adjusted accordingly.
+        method: str
+            Resampling method.
         """
         if (self.meta['crs'] != crs) or cell_width:
-            data, meta = reproject_raster(self.path, crs,
-                                          cell_width=cell_width, cell_height=cell_height,
-                                          method=self.resample, compression='DEFLATE')
-            self.data = data
-            self.meta = meta
+
+            transform, width, height = calculate_default_transform(self.meta['crs'], crs,
+                                                                   self.meta['width'],
+                                                                   self.meta['height'],
+                                                                   *self.bounds)
+            # If a destination cell width and height was provided, then it
+            # calculates the new boundaries, with, heigh and transform
+            # depending on the new cell size.
+            if cell_width and cell_height:
+                bounds = rasterio.transform.array_bounds(height, width, transform)
+                width = int(width * (transform[0] / cell_width))
+                height = int(height * (abs(transform[4]) / cell_height))
+                transform = rasterio.transform.from_origin(bounds[0], bounds[3],
+                                                           cell_width, cell_height)
+            # Updates the metadata
+            out_meta = self.meta.copy()
+            out_meta.update({
+                'crs': crs,
+                'transform': transform,
+                'width': width,
+                'height': height,
+                'compress': 'DEFLATE'
+            })
+            destination = np.full((height, width), self.meta['nodata'])
+            reproject(
+                source=self.data,
+                destination=destination,
+                src_transform=self.meta['transform'],
+                src_crs=self.meta['crs'],
+                dst_transform=transform,
+                dst_crs=crs,
+                resampling=Resampling[method])
+
+            self.data = destination
+            self.meta = out_meta
+
             if output_path:
                 self.save(output_path)
 
@@ -1379,8 +1420,8 @@ class RasterLayer(_Layer):
         polygon.crs = self.meta['crs']
         return polygon
 
-    def save(self, output_path: str):
-        """Saves the raster layer as a `tif` file.
+    def save(self, output_path: str, name: str = None, type: str = 'tif', append_subdataset: bool = False):
+        """Saves the raster layer as a `tif` or `gpkg` file.
 
         It uses the ``name`` attribute as the name of the file.
 
@@ -1388,14 +1429,30 @@ class RasterLayer(_Layer):
         ----------
         output_path: str
             A folder path where to save the output dataset.
+        name: str
+            name of the file or geopackage.
+        type: str
+            Type of file to save.
+        append_subdataset: bool
+            Add subdataset to existing geopackage.
         """
+        
+        if name is None:
+            name = self.name
         output_file = os.path.join(output_path,
-                                   self.name + '.tif')
-        self.path = output_file
-        os.makedirs(output_path, exist_ok=True)
-        self.meta.update(compress='DEFLATE', driver='GTiff')
-        with rasterio.open(output_file, "w", **self.meta) as dest:
-            dest.write(self.data, 1)
+                                   name + f'.{type}')
+        if type == 'tif':
+            os.makedirs(output_path, exist_ok=True)
+            self.path = output_file
+            self.meta.update(compress='DEFLATE', driver='GTiff')
+            with rasterio.open(output_file, "w", **self.meta) as dest:
+                dest.write(self.data, 1)
+        elif type == 'gpkg':
+            self.meta.update(driver='GPKG')
+            output_file = os.path.join(output_path + f'.{type}')
+            with rasterio.open(output_file, "w", raster_table = name, APPEND_SUBDATASET = append_subdataset,
+                               count=1, **self.meta) as dest:
+                dest.write(self.data, 1)
 
     def align(self, base_layer: Union['RasterLayer', str],
               rescale: Optional[bool] = None,
@@ -1436,8 +1493,6 @@ class RasterLayer(_Layer):
         layer, meta = align_raster(base_layer, self,
                                    method=self.resample)
         data = layer
-        meta = meta
-
         if rescale:
             data[data == meta['nodata']] = np.nan
             meta['nodata'] = np.nan

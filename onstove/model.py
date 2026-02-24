@@ -7,6 +7,7 @@ from warnings import warn
 import dill
 import matplotlib
 import csv
+from matplotlib.ticker import FuncFormatter
 from pyproj import CRS
 import pandas as pd
 import numpy as np
@@ -19,7 +20,7 @@ from copy import copy
 from csv import DictReader
 from time import time
 from matplotlib import cm
-from matplotlib.colors import to_rgb
+from matplotlib.colors import BoundaryNorm, to_rgb, LinearSegmentedColormap, to_hex
 from matplotlib.offsetbox import (TextArea, AnnotationBbox, VPacker, HPacker)
 from rasterio import features
 from rasterio.fill import fillnodata
@@ -58,6 +59,9 @@ from onstove._utils import Processes, deep_update
 from onstove._layer_utils import raster_setter
 import scipy.stats as stats
 from scipy.interpolate import PchipInterpolator
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from matplotlib.colors import ListedColormap
+import copy
 
 
 def timeit(func):
@@ -107,7 +111,7 @@ class DataProcessor:
     """
 
     def __init__(self, project_crs: Optional[Union['pyproj.CRS', int]] = 3395,
-                 cell_size: tuple[float] = (1000,1000), output_directory: str = '.'):
+                 cell_size: tuple[float, float] = (1000.0, 1000.0), output_directory: str = '.'):
         """
         Initializes the class and sets an empty layers dictionaries.
         """
@@ -126,7 +130,10 @@ class DataProcessor:
 
         self.layers = {}
         self.project_crs = project_crs
-        self.cell_size = cell_size
+        try:
+            self.cell_size = (float(cell_size[0]), float(cell_size[1]))
+        except Exception: # allow a single scalar to mean square cells
+            self.cell_size = (float(cell_size), float(cell_size))        
         self.output_directory = output_directory
         self.mask_layer = None
         self.conn = None
@@ -1219,10 +1226,12 @@ class OnStove(DataProcessor):
             'discountrate': 'discount_rate',
             'healthspilloversparameter': 'health_spillovers_parameter',
             'wcosts': 'w_costs',
+            'wsalvage': 'w_salvage',
             'wenvironment': 'w_environment',
             'whealth': 'w_health',
             'wspillovers': 'w_spillovers',
             'wtime': 'w_time',
+            'wsalvage': 'w_salvage',
             'countryname': 'country_name',
             'countrycode': 'country_code',
             'populationstartyear': 'population_start_year',
@@ -1481,8 +1490,80 @@ class OnStove(DataProcessor):
             if (name != "Biogas") & (name != "Electricity"):
                 tech.pop_sqkm.loc[isurban] = remaining_urbpop * tech.current_share_urban / remaining_urbshare
             tech.pop_sqkm = tech.pop_sqkm / self.gdf["Calibrated_pop"]
+
+    def set_baseline_map(self, baseline_map: gpd.GeoDataFrame, column_map: dict[str, str]) -> dict:
+        """Sets the baseline fuel shares using a spatial overlay.
+    
+        Parameters
+        ----------
+        baseline_map : gpd.GeoDataFrame
+            A GeoDataFrame containing polygons with fuel share attributes.
+        column_map : dict
+            A mapping from column names in the baseline_map to technology names in the model.
+    
+        This function performs a spatial join between the baseline_map and the model's main GeoDataFrame (self.gdf).
+        It then extracts the fuel share information based on the provided column_map and assigns it to the corresponding
+        technologies in the model. For cells that don't intersect any polygon, it finds the nearest polygon.
+        """
+        # Checking crs and matching baseline_map to self.gdf crs
+        if baseline_map.crs != self.gdf.crs:
+            baseline_map = baseline_map.to_crs(self.gdf.crs)
         
-    def set_base_fuel(self, techs: list = None):
+        # Spatial join baseline_map to self.gdf
+        self.gdf = gpd.sjoin(self.gdf, baseline_map[list(column_map.keys()) + ['geometry']], 
+                            how='left', predicate='intersects')        
+        
+        # Find cells without matches (where index_right is NaN)
+        unmatched_mask = self.gdf['index_right'].isna()
+        n_unmatched = unmatched_mask.sum()
+        
+        if n_unmatched > 0:
+            print(f"Warning: {n_unmatched} cells did not intersect any baseline polygon. Finding nearest polygons...")
+            
+            # Get unmatched cells
+            unmatched_gdf = self.gdf.loc[unmatched_mask].copy()
+            
+            # For each unmatched cell, find nearest polygon
+            for idx in unmatched_gdf.index:
+                point = unmatched_gdf.loc[idx, 'geometry']
+                
+                # Calculate distances to all polygons
+                distances = baseline_map.geometry.distance(point)
+                nearest_idx = distances.idxmin()
+                
+                # Assign values from nearest polygon
+                for col in column_map.keys():
+                    self.gdf.loc[idx, col] = baseline_map.loc[nearest_idx, col]
+                
+                # Update index_right to indicate it was matched (using negative index to distinguish)
+                self.gdf.loc[idx, 'index_right'] = -(nearest_idx + 1)
+            
+            print(f"Successfully assigned baseline data to all {n_unmatched} unmatched cells using nearest neighbor.")
+        
+        # Create base_fuels dictionary
+        base_fuels = {}
+        for col, tech_name in column_map.items():
+            tech_share = pd.Series(self.gdf[col].values, index=self.gdf.index, dtype=float).fillna(0.0)
+            if tech_name in self.techs.keys():
+                self.techs[tech_name].pop_sqkm = tech_share
+            else:
+                raise KeyError(f"Technology {tech_name} not found in model technologies.")
+            base_fuels[tech_name] = self.techs[tech_name]
+
+        # Ensure all technologies in the model have a pop_sqkm Series.
+        # Technologies not present in the baseline_map get zeros.
+        for tech_name, tech in self.techs.items():
+            if tech_name not in base_fuels:
+                tech.pop_sqkm = pd.Series(0.0, index=self.gdf.index)
+        
+        return base_fuels        
+    
+    def set_base_fuel(
+            self,
+            techs: Optional[list] = None,
+            baseline_map: Optional[gpd.GeoDataFrame] = None,
+            column_map: Optional[dict[str, str]] = None,
+            ) -> None:
         """Defines the base fuel properties according to the technologies currently used in the study area.
 
         The user can either set `is_base = True` to a subclass of the technology class (e.g. biogas or LPG).
@@ -1502,14 +1583,22 @@ class OnStove(DataProcessor):
         Technology.health_parameters
         Technology.discount_fuel_cost
         """
-        if techs is None:
-            techs = list(self.techs.values())
-        base_fuels = {}
-        for tech in techs:
-            share = tech.current_share_rural + tech.current_share_urban
-            if (share >= 0) or tech.is_base:
-                tech.is_base = True
-                base_fuels[tech.name] = tech
+        if baseline_map is not None:
+            if column_map is None:
+                raise ValueError("If baseline_map is provided, column_map must also be provided.")
+            base_fuels = self.set_baseline_map(baseline_map=baseline_map, column_map=column_map)
+        
+        else:
+            
+            if techs is None:
+                techs = list(self.techs.values())
+            base_fuels = {}
+            for tech in techs:
+                share = tech.current_share_rural + tech.current_share_urban
+                if (share >= 0) or tech.is_base:
+                    tech.is_base = True
+                    base_fuels[tech.name] = tech
+        # Ignore
         if len(base_fuels) == 1:
             self.base_fuel = copy(list(base_fuels.values())[0])
             self.base_fuel.carb(self)
@@ -1523,33 +1612,46 @@ class OnStove(DataProcessor):
                                                 index=self.gdf.index)
             self.base_fuel.om_cost = pd.Series([self.base_fuel.om_cost] * self.gdf.shape[0],
                                                index=self.gdf.index)
+        # Ignore ends
+
         else:
-            if len(base_fuels) == 0:
-                base_fuels = self.techs
-            base_fuel = Technology(name='Base fuel')
-            base_fuel.carbon = 0
-            base_fuel.total_time_yr = 0
+            
+            if baseline_map is not None:
+                # Call the new function
+                base_fuel = Technology(name='Base fuel')
+                base_fuel.carbon = 0
+                base_fuel.total_time_yr = 0
+                # pass
+            
+            else:
+                base_fuel = Technology(name='Base fuel')
+                base_fuel.carbon = 0
+                base_fuel.total_time_yr = 0
 
-            # base_tech_types = [type(tech) for tech in base_fuels.values()]
+                # base_tech_types = [type(tech) for tech in base_fuels.values()]
 
-            self._techshare_sumtoone()
-            self._ecooking_adjustment()
-            base_fuels["Biogas"].total_time(self)
-            required_energy_hh = base_fuels["Biogas"].required_energy_hh(self)
-            factor = self.gdf['biogas_energy'] / (required_energy_hh * self.gdf['Households'])
-            factor[factor > 1] = 1
-            base_fuels["Biogas"].factor = factor
-            base_fuels["Biogas"].households = self.gdf['Households'] * factor
-            self._biogas_adjustment()
-            self._pop_tech()
-            self._techshare_allocation(base_fuels)
+                self._techshare_sumtoone()
+                self._ecooking_adjustment()
+                base_fuels["Biogas"].total_time(self)
+                required_energy_hh = base_fuels["Biogas"].required_energy_hh(self)
+                factor = self.gdf['biogas_energy'] / (required_energy_hh * self.gdf['Households'])
+                factor[factor > 1] = 1
+                base_fuels["Biogas"].factor = factor
+                base_fuels["Biogas"].households = self.gdf['Households'] * factor
+                self._biogas_adjustment()
+                self._pop_tech()
+                self._techshare_allocation(base_fuels)
 
             self.get_clean_cooking_access(base_fuels=base_fuels)
+
+                
 
             for name, tech in base_fuels.items():
 
                 tech.carb(self)
                 if name != "Biogas":
+                    tech.total_time(self)
+                else:
                     tech.total_time(self)
                 tech.required_energy(self)
 
@@ -1597,6 +1699,8 @@ class OnStove(DataProcessor):
                             techs[row['Fuel']] = LPG()
                         elif 'biomass' in row['Fuel'].lower():
                             techs[row['Fuel']] = Biomass()
+                        elif 'ethanol' in row['Fuel'].lower():
+                            techs[row['Fuel']] = LPG()
                         elif 'pellets' in row['Fuel'].lower():
                             techs[row['Fuel']] = Biomass()
                         elif 'charcoal' in row['Fuel'].lower():
@@ -1613,7 +1717,7 @@ class OnStove(DataProcessor):
                         techs[row['Fuel']][row['Param']] = int(row['Value'])
                     elif row['data_type'] == 'float':
                         techs[row['Fuel']][row['Param']] = float(row['Value'])
-                    elif row['data_type'] == 'string':
+                    elif row['data_type'] in ['string', 'str']:
                         techs[row['Fuel']][row['Param']] = str(row['Value'])
                     elif row['data_type'] == 'bool':
                         techs[row['Fuel']][row['Param']] = str(row['Value']).lower() in ['true', 't', 'yes', 'y', '1']
@@ -1667,6 +1771,7 @@ class OnStove(DataProcessor):
         current_elec
         final_elec
         """
+        # TODO: give the option for the user to use a custom distance layer
         if self._electrified_weight is None:
             if "Transformers_dist" in self.gdf.columns:
                 self.gdf["Elec_dist"] = self.gdf["Transformers_dist"]
@@ -1700,68 +1805,23 @@ class OnStove(DataProcessor):
         See also
         --------
         electrified_weight
-        final_elec
         read_scenario_data
         specs
         """
         elec_rate = self.specs["elec_rate"]
 
         self.gdf["Current_elec"] = 0
-
-        i = 1
-        elec_pop = 0
         total_pop = self.gdf["Calibrated_pop"].sum()
 
-        while elec_pop <= total_pop * elec_rate:
-            bool = (self.electrified_weight >= i)
-            elec_pop = self.gdf.loc[bool, "Calibrated_pop"].sum()
-
-            self.gdf.loc[bool, "Current_elec"] = 1
-            i = i - 0.01
-
-        self.i = i
-
-    def final_elec(self):
-        """Calibrates the electrified population within each cell.
-
-        This is a "fine-tuning" of the electrified population. It uses the ``Current_elec`` column of the :attr:`gdf`
-        GeoDataFrame (calculated using the :meth:`current_elec` method) and the ``Calibrated_pop`` column (calculated
-        using the :meth:`calibrate_current_pop` method) to get the population that is electrified within each
-        electrified settlement, according to the ``Elec_rate`` provided by the user (stored in :attr:`specs`).
-
-        See also
-        --------
-        electrified_weight
-        current_elec
-        read_scenario_data
-        specs
-        """
-        elec_rate = self.specs["elec_rate"]
-
-        self.gdf["Elec_pop_calib"] = self.gdf["Calibrated_pop"]
-
-        i = self.i + 0.01
-        total_pop = self.gdf["Calibrated_pop"].sum()
-        elec_pop = self.gdf.loc[self.gdf["Current_elec"] == 1, "Calibrated_pop"].sum()
-        diff = elec_pop - (total_pop * elec_rate)
-        factor = diff / self.gdf["Current_elec"].count()
-
-        while elec_pop > total_pop * elec_rate:
-
-            new_bool = (self.i <= self.electrified_weight) & (self.electrified_weight <= i)
-
-            self.gdf.loc[new_bool, "Elec_pop_calib"] -= factor
-            self.gdf.loc[self.gdf["Elec_pop_calib"] < 0, "Elec_pop_calib"] = 0
-            self.gdf.loc[self.gdf["Elec_pop_calib"] == 0, "Current_elec"] = 0
-            bool = self.gdf["Current_elec"] == 1
-
-            elec_pop = self.gdf.loc[bool, "Elec_pop_calib"].sum()
-
-            new_bool = bool & new_bool
-            if new_bool.sum() == 0:
-                i = i + 0.01
-
-        self.gdf.loc[self.gdf["Current_elec"] == 0, "Elec_pop_calib"] = 0
+        index = self.electrified_weight.sort_values(ascending=False).index
+        cum_pop = self.gdf.loc[index, "Calibrated_pop"].cumsum()
+        self.gdf.loc[cum_pop <= total_pop * elec_rate, "Current_elec"] = 1
+        self.gdf.loc[self.gdf['Current_elec'] == 1, "Calibrated_pop"].sum()
+        index_plus_one = index[sum(cum_pop <= total_pop * elec_rate)]
+        self.gdf.loc[self.gdf.iloc[[index_plus_one]].index, 'Current_elec'] = 1
+        self.gdf["Elec_pop_calib"] = 0.0
+        self.gdf.loc[self.gdf["Current_elec"]==1, "Elec_pop_calib"] = self.gdf.loc[self.gdf["Current_elec"]==1, "Calibrated_pop"]
+        
 
     def calibrate_current_pop(self):
         """Calibrates the spatial population in each cell according to the user defined population in the start year
@@ -2043,7 +2103,9 @@ class OnStove(DataProcessor):
         self.gdf['value_of_time'] = norm_layer * self.specs[
             'minimum_wage'] / 30 / 8  # convert $/months to $/h (8 working hours per day)
 
-    def run(self, technologies: Union[list[str], str] = 'all', restriction: bool = True, affordability_categories: list = ['<5%', '5-15%', '15%+']):
+    def run(self, technologies: Optional[Union[list, dict, str]] = 'all', restriction: bool = True, prioritize: bool = True,
+            affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False,
+            tech_groups: Optional[dict[str, list[str]]] = None):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
         It loops through the ``technologies`` and calculates all costs, benefit and the net-benefit of cooking with
@@ -2074,6 +2136,15 @@ class OnStove(DataProcessor):
             notation used. First threshold with a < sign preceding, intermediate thresholds with a - sign in between the end values
             for that threshold, and last threshold with a + sign.
             Example: '['<5%', '5-15%', '15-25%', '25%+']'
+
+        target: str, default 'net_benefit'
+            Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
+            'cost_income_ratio'.
+
+        tech_groups: dict[str, list[str]], optional
+            Optional dictionary mapping group names to lists of technology names. If a share key is a group,
+            the share is treated as a single competitive pool among the group's technologies, assigned by
+            the selected target metric (idxmax/idxmin) without equal pre-splitting.
 
         See also
         --------
@@ -2108,10 +2179,23 @@ class OnStove(DataProcessor):
             techs = [tech for tech in self.techs.values()]
         elif isinstance(technologies, list):
             techs = [self.techs[name] for name in technologies]
-        else:
-            raise ValueError("technologies must be 'all' or a list of strings with the technology names to run.")
-
-        # Loop through each technology and calculate all benefits and costs
+        elif isinstance(technologies, dict):
+            techs = set()
+            for shares in technologies.values():
+                techs.update(shares.keys())
+            print(techs)
+            # Expand technology groups into individual technology names
+            if tech_groups is not None:
+                expanded_techs = set()
+                for tech_name in techs:
+                    if tech_name in tech_groups:
+                        # This is a group name, expand it to individual technologies
+                        expanded_techs.update(tech_groups[tech_name])
+                    else:
+                        # This is an individual technology name
+                        expanded_techs.add(tech_name)
+                techs = expanded_techs
+            techs = [self.techs[name] for name in techs]
         for tech in techs:
             print(f'Calculating health benefits for {tech.name}...')
             if not tech.is_base:
@@ -2130,32 +2214,65 @@ class OnStove(DataProcessor):
             tech.salvage(self)
             print(f'Calculating net benefit for {tech.name}...\n')
             tech.net_benefit(self, self.specs['w_health'], self.specs['w_spillovers'],
-                             self.specs['w_environment'], self.specs['w_time'], self.specs['w_costs'])
-            tech.affordability_categories(self, categories=affordability_categories)
+                             self.specs['w_environment'], self.specs['w_time'], self.specs['w_costs'],
+                             self.specs['w_salvage'])
+            if 'absolute_wealth' in self.gdf.columns or 'income' in self.gdf.columns:
+                tech.affordability_categories(self, categories=affordability_categories)
 
         print('Getting maximum net benefit technologies...')
-        self.maximum_net_benefit(techs, restriction=restriction)
+        if isinstance(technologies, list):
+            self.maximum_net_benefit(techs, restriction=restriction, partial_access = partial_access, target=target)
+        elif isinstance(technologies, dict):
+            self.stove_share_assignment(technologies, restriction=restriction, target=target, prioritize=prioritize, tech_groups=tech_groups)
+        if target == 'net_benefit':
+            column = 'max_benefit_tech'
+        elif target == 'cost_income_ratio':
+            column = 'most_affordable_tech'
         print('Extracting indicators...')
         print('    - Lives saved')
-        self.extract_lives_saved()
+        self.extract_lives_saved(column=column)
         print('    - Health costs')
-        self.extract_health_costs_saved()
+        self.extract_health_costs_saved(column=column)
         print('    - Time saved')
-        self.extract_time_saved()
+        self.extract_time_saved(column=column)
         print('    - Opportunity cost')
-        self.extract_opportunity_cost()
+        self.extract_opportunity_cost(column=column)
         print('    - Avoided emissions')
-        self.extract_reduced_emissions()
+        self.extract_reduced_emissions(column=column)
         print('    - Avoided emissions costs')
-        self.extract_emissions_costs_saved()
+        self.extract_emissions_costs_saved(column=column)
         print('    - Investment costs')
-        self.extract_investment_costs()
+        self.extract_investment_costs(column=column)
         print('    - Fuel costs')
-        self.extract_fuel_costs()
+        self.extract_fuel_costs(column=column)
         print('    - OM costs')
-        self.extract_om_costs()
+        self.extract_om_costs(column=column)
         print('    - Salvage value')
-        self.extract_salvage()
+        self.extract_salvage(column=column)
+        
+        # Create affordability columns for the selected technology
+        if 'absolute_wealth' in self.gdf.columns or 'income' in self.gdf.columns:
+            print('    - Affordability for selected technologies')
+            # Initialize columns
+            self.gdf[f'affordability_category_{column}'] = None
+            self.gdf[f'affordability_support_required_{column}'] = np.nan
+            
+            # Populate from tech-specific columns based on selected tech
+            for tech_name in self.gdf[column].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[column] == tech_name
+                
+                # Copy affordability category if it exists
+                cat_col = f'affordability_category_{tech_name}'
+                if cat_col in self.gdf.columns:
+                    self.gdf.loc[mask, f'affordability_category_{column}'] = self.gdf.loc[mask, cat_col]
+                
+                # Copy affordability support required if it exists
+                support_col = f'affordability_support_required_{tech_name}'
+                if support_col in self.gdf.columns:
+                    self.gdf.loc[mask, f'affordability_support_required_{column}'] = self.gdf.loc[mask, support_col]
+        
         print('Done')
 
     # TODO: check if this function is still needed
@@ -2166,7 +2283,8 @@ class OnStove(DataProcessor):
         columns_dict['max_benefit_tech'] = 'first'
         return columns_dict
 
-    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True):
+    def maximum_net_benefit(self, techs: list['Technology'], restriction: bool = True, partial_access = True,
+                            target: str = 'net_benefit'):
         """Extracts the technology or technology combinations producing the highest net-benefit in each cell.
 
         It saves the technology with highest net-benefit in the ``max_benefi_tech`` column of the :attr:`gdf`
@@ -2195,79 +2313,435 @@ class OnStove(DataProcessor):
         extract_om_costs
         extract_salvage
         """
-        net_benefit_cols = [col for col in self.gdf if 'net_benefit_' in col]
-        benefits_cols = [col for col in self.gdf if 'benefits_' in col]
-
-        for benefit, net in zip(benefits_cols, net_benefit_cols):
-            self.gdf[net + '_temp'] = self.gdf[net]
-            if restriction in [True, 'yes', 'y', 'Y', 'Yes', 'PositiveBenefits', 'Positive_Benefits']:
-                self.gdf.loc[self.gdf[benefit] < 0, net + '_temp'] = np.nan
+        if target == 'net_benefit':
+            value_cols = [col for col in self.gdf if 'net_benefit_' in col]
+            benefit_cols = [col for col in self.gdf if 'benefits_' in col]
+            result_tech = 'max_benefit_tech'
+            result_value = 'maximum_net_benefit'
+            pick_func = 'max'
+            # apply restriction only for net-benefit
+            for benefit, net in zip(benefit_cols, value_cols):
+                self.gdf[net + '_temp'] = self.gdf[net]
+                if restriction in [True, 'yes', 'y', 'Y', 'Yes', 'PositiveBenefits', 'Positive_Benefits']:
+                    self.gdf.loc[self.gdf[benefit] < 0, net + '_temp'] = np.nan
+        elif target == 'cost_income_ratio':
+            value_cols = [col for col in self.gdf if 'cost_income_ratio_' in col]
+            benefit_cols = [col.replace('cost_income_ratio_', 'benefits_') for col in value_cols]
+            result_tech = 'most_affordable_tech'
+            result_value = 'most_affordable_cost_income_ratio'
+            pick_func = 'min'
+            for cost_col, ben_col in zip(value_cols, benefit_cols):
+                self.gdf[cost_col + '_temp'] = self.gdf[cost_col].copy()
+                if ben_col in self.gdf.columns:
+                    self.gdf.loc[self.gdf[ben_col] < 0, cost_col + '_temp'] = np.nan
+        else:
+            raise ValueError("target must be 'net_benefit' or 'cost_income_ratio'")
 
         temps = [col for col in self.gdf if '_temp' in col]
-        self.gdf["max_benefit_tech"] = self.gdf[temps].idxmax(axis=1).astype('string')
+        if pick_func == 'max':
+            self.gdf[result_tech] = self.gdf[temps].idxmax(axis=1).astype('string')
+            self.gdf[result_value] = self.gdf[temps].max(axis=1)
+        else:  # min
+            self.gdf[result_tech] = self.gdf[temps].idxmin(axis=1).astype('string')
+            self.gdf[result_value] = self.gdf[temps].min(axis=1)
 
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
-        self.gdf["maximum_net_benefit"] = self.gdf[temps].max(axis=1)
+        self.gdf[result_tech] = self.gdf[result_tech].str.replace("net_benefit_", "").str.replace("cost_income_ratio_", "").str.replace("_temp", "")
 
-        gdf = gpd.GeoDataFrame()
-        gdf_copy = self.gdf.copy()
-        # TODO: Change this to a while loop that checks the sum of number of households supplied against the total hhs
-        for tech in techs:
-            current = (tech.households < gdf_copy['Households']) & \
-                      (gdf_copy["max_benefit_tech"] == tech.name)
-            dff = gdf_copy.loc[current].copy()
-            if current.sum() > 0:
-                # dff.loc[current, "maximum_net_benefit"] *= tech.factor.loc[current]
-                dff.loc[current, f'net_benefit_{tech.name}_temp'] = np.nan
+        if target == 'cost_income_ratio':
+            self.gdf['maximum_net_benefit'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                mask = self.gdf[result_tech] == tech_name
+                net_ben_col = f'net_benefit_{tech_name}'
+                if net_ben_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+        elif target == 'net_benefit':
+            self.gdf['most_affordable_cost_income_ratio'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                mask = self.gdf[result_tech] == tech_name
+                cost_ratio_col = f'cost_income_ratio_{tech_name}'
+                if cost_ratio_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'most_affordable_cost_income_ratio'] = self.gdf.loc[mask, cost_ratio_col]
 
-                second_benefit_cols = temps.copy()
-                second_benefit_cols.remove(f'net_benefit_{tech.name}_temp')
-                second_best = dff.loc[current, second_benefit_cols].idxmax(axis=1)
+        # Partial access adjustment only meaningful for net-benefit
+        if target != 'net_benefit':
+            return
+        if partial_access:
+            # ...existing partial_access block remains unchanged...
+            # (uses benefit/net columns; safe only for net_benefit target)
+            gdf = gpd.GeoDataFrame()
+            gdf_copy = self.gdf.copy()
+            for tech in techs:
+                current = (tech.households < gdf_copy['Households']) & \
+                          (gdf_copy[result_tech] == tech.name)
+                dff = gdf_copy.loc[current].copy()
+                if current.sum() > 0:
+                    dff.loc[current, f'net_benefit_{tech.name}_temp'] = np.nan
 
-                second_best.replace(np.nan, 'NaN', inplace=True)
-                second_best = second_best.str.replace("net_benefit_", "")
-                second_best = second_best.str.replace("_temp", "")
-                second_best.replace('NaN', np.nan, inplace=True)
+                    second_benefit_cols = temps.copy()
+                    second_benefit_cols.remove(f'net_benefit_{tech.name}_temp')
+                    second_best = dff.loc[current, second_benefit_cols].idxmax(axis=1)
 
-                second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1) #* (1 - tech.factor.loc[current])
+                    second_best.replace(np.nan, 'NaN', inplace=True)
+                    second_best = second_best.str.replace("net_benefit_", "")
+                    second_best = second_best.str.replace("_temp", "")
+                    second_best.replace('NaN', np.nan, inplace=True)
 
-                elec_factor = dff['Elec_pop_calib'] / dff['Calibrated_pop']
-                dff['max_benefit_tech'] = second_best
-                dff['maximum_net_benefit'] = second_tech_net_benefit
-                dff['Calibrated_pop'] *= (1 - tech.factor.loc[current])
-                dff['Households'] *= (1 - tech.factor.loc[current])
+                    second_tech_net_benefit = dff.loc[current, second_benefit_cols].max(axis=1)
 
-                self.gdf.loc[current, 'Calibrated_pop'] *= tech.factor.loc[current]
-                self.gdf.loc[current, 'Households'] *= tech.factor.loc[current]
-                if tech.name == 'Electricity':
-                    dff['Elec_pop_calib'] *= 0
-                #     self.gdf.loc[current, 'Elec_pop_calib'] *= tech.factor.loc[current]
-                else:
-                    self.gdf.loc[current, 'Elec_pop_calib'] = self.gdf.loc[current, 'Calibrated_pop'] * elec_factor
-                    dff['Elec_pop_calib'] = dff['Calibrated_pop'] * elec_factor
-                gdf = pd.concat([gdf, dff])
+                    elec_factor = dff['Elec_pop_calib'] / dff['Calibrated_pop']
+                    dff[result_tech] = second_best
+                    dff[result_value] = second_tech_net_benefit
+                    dff['Calibrated_pop'] *= (1 - tech.factor.loc[current])
+                    dff['Households'] *= (1 - tech.factor.loc[current])
 
-        self.gdf = pd.concat([self.gdf, gdf])
+                    self.gdf.loc[current, 'Calibrated_pop'] *= tech.factor.loc[current]
+                    self.gdf.loc[current, 'Households'] *= tech.factor.loc[current]
+                    if tech.name == 'Electricity':
+                        dff['Elec_pop_calib'] *= 0
+                    else:
+                        self.gdf.loc[current, 'Elec_pop_calib'] = self.gdf.loc[current, 'Calibrated_pop'] * elec_factor
+                        dff['Elec_pop_calib'] = dff['Calibrated_pop'] * elec_factor
+                    gdf = pd.concat([gdf, dff])
 
-        for net in net_benefit_cols:
-            self.gdf[net + '_temp'] = self.gdf[net]
+            self.gdf = pd.concat([self.gdf, gdf])
 
-        temps = [col for col in self.gdf if 'temp' in col]
+            for net in value_cols:
+                self.gdf[net + '_temp'] = self.gdf[net]
 
-        for tech in self.gdf["max_benefit_tech"].unique():
-            index = self.gdf.loc[self.gdf['max_benefit_tech'] == tech].index
-            self.gdf.loc[index, f'net_benefit_{tech}_temp'] = np.nan
+            temps = [col for col in self.gdf if 'temp' in col]
 
-        isna = self.gdf["max_benefit_tech"].isna()
+            for tech in self.gdf[result_tech].unique():
+                index = self.gdf.loc[self.gdf[result_tech] == tech].index
+                self.gdf.loc[index, f'net_benefit_{tech}_temp'] = np.nan
 
-        if isna.sum() > 0:
-            self.gdf.loc[isna, 'max_benefit_tech'] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("net_benefit_", "")
-        self.gdf['max_benefit_tech'] = self.gdf['max_benefit_tech'].str.replace("_temp", "")
-        self.gdf.loc[isna, "maximum_net_benefit"] = self.gdf.loc[isna, temps].max(axis=1)
+            isna = self.gdf[result_tech].isna()
+
+            if isna.sum() > 0:
+                self.gdf.loc[isna, result_tech] = self.gdf.loc[isna, temps].idxmax(axis=1).astype(str)
+            self.gdf[result_tech] = self.gdf[result_tech].str.replace("net_benefit_", "").str.replace("_temp", "")
+            self.gdf.loc[isna, result_value] = self.gdf.loc[isna, temps].max(axis=1)
 
     # TODO: check if we need this method
+
+    def stove_share_assignment(self, techs: dict[str,dict[str,float]], target: str = 'net_benefit', 
+                               restriction: bool = True, prioritize: bool = True, clear_none: bool = True,
+                               tech_groups: Optional[dict[str, list[str]]] = None):
+        """Extracts the technology or technology combinations producing the highest net-benefit in each cell
+        while achieving user defined shares.
+
+        It saves the technology with highest net-benefit in the ``max_benefi_tech_user_share`` column of the :attr:`gdf`
+        GeoDataframe. This also dictates the benefits and costs extracted in the extract functions.
+
+        Parameters
+        ----------
+        techs: dict of str:float
+            Dictionary with technology names or group names as keys and their user defined share as values.
+        tech_groups: dict[str, list[str]], optional
+            Optional dictionary mapping group names to lists of technology names. If a share key is a group,
+            the share is treated as a single competitive pool among the group's technologies, assigned by
+            the selected target metric (idxmax/idxmin) without equal pre-splitting.
+        target: str, default 'net_benefit'
+            Target to use for the assignment of stoves according to the user defined shares. Options are 'net_benefit' or
+            'cost_income_ratio'.
+        restriction: bool, default True
+            Whether to have the restriction of only selecting technologies producing a positive benefit compared to the
+            baseline. This avoids selecting stoves simply due to them being cheaper.
+
+        See also
+        --------
+        run
+        extract_lives_saved
+        extract_health_costs_saved
+        extract_time_saved
+        extract_opportunity_cost
+        extract_reduced_emissions
+        extract_emissions_costs_saved
+        extract_investment_costs
+        extract_fuel_costs
+        extract_om_costs
+        extract_salvage
+
+        """      
+        if target == 'net_benefit':
+            net_benefit_cols = [col for col in self.gdf if 'net_benefit_' in col]
+            benefits_cols = [col for col in self.gdf if 'benefits_' in col]
+
+            for benefit, net in zip(benefits_cols, net_benefit_cols):
+                if restriction in [True, 'yes', 'y', 'Y', 'Yes', 'PositiveBenefits', 'Positive_Benefits']:
+                    self.gdf.loc[self.gdf[benefit] < 0, net] = np.nan
+            
+            result_tech = 'max_benefit_tech'
+            result_value = 'maximum_net_benefit'
+
+        elif target == 'cost_income_ratio':
+            value_cols = [col for col in self.gdf if 'cost_income_ratio_' in col]
+            benefit_cols = [col.replace('cost_income_ratio_', 'benefits_') for col in value_cols]
+            for cost_col, ben_col in zip(value_cols, benefit_cols):
+                if ben_col in self.gdf.columns:
+                    self.gdf.loc[self.gdf[ben_col] < 0, cost_col] = np.nan
+
+            result_tech = 'most_affordable_tech'
+            result_value = 'most_affordable_cost_income_ratio'
+
+        for region, shares in techs.items():
+            if region == 'Urban':
+                isurban = self.gdf['IsUrban'] > 20
+            else:
+                isurban = self.gdf['IsUrban'] < 20
+
+            techs_shares = dict(sorted(shares.items(), key=lambda item: item[1], reverse=True))
+            total_pop = self.gdf.loc[isurban, 'Calibrated_pop'].sum()
+            tech_target_pop = {tech: int(share * total_pop) for tech, share in techs_shares.items()}
+
+            unassigned_ids = self.gdf.loc[isurban].index.copy() # Control of cells that are unassigned
+            tech_target_pop_unassigned = tech_target_pop.copy() # Control of unassigned population for each technology
+            self.gdf.loc[isurban, result_tech] = None
+            self.gdf.loc[isurban, result_value] = None
+            self.gdf.loc[isurban, 'technology_option'] = None
+
+            # First, handle group shares competitively (no equal split): assign best within-group until group target is met
+            if tech_groups:
+                group_targets = {k: v for k, v in tech_target_pop.items() if k in tech_groups}
+                for group_name, group_target in group_targets.items():
+                    if group_target <= 0:
+                        continue
+                    group_cols = [f"{target}_{t}" for t in tech_groups[group_name] if f"{target}_{t}" in self.gdf.columns]
+                    if len(group_cols) == 0:
+                        # No valid target columns found for this group
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    # Available cells for assignment
+                    condition = self.gdf.loc[isurban, result_tech].isna()
+                    available_cells = self.gdf.loc[condition & isurban].copy()
+                    if len(available_cells) == 0:
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    # Pick winning tech per cell within the group based on target metric
+                    if target == 'net_benefit':
+                        available_cells[result_tech] = available_cells[group_cols].idxmax(axis=1).astype('string')
+                        available_cells[result_value] = available_cells[group_cols].max(axis=1)
+                        sort_ascending = False
+                    else:  # cost_income_ratio
+                        available_cells[result_tech] = available_cells[group_cols].idxmin(axis=1).astype('string')
+                        available_cells[result_value] = available_cells[group_cols].min(axis=1)
+                        sort_ascending = False
+                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+
+                    # Consider only rows where winner is in the group
+                    candidates = available_cells[available_cells[result_tech].isin(tech_groups[group_name])]
+                    if len(candidates) == 0:
+                        tech_target_pop[group_name] = -999
+                        continue
+
+                    candidates = candidates.sort_values(result_value, ascending=sort_ascending)
+                    candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                    assigned = candidates[candidates['cummulative_pop'] <= group_target]
+                    if candidates['Calibrated_pop'].sum() > group_target and len(candidates) > len(assigned):
+                        assigned = pd.concat([assigned, candidates.iloc[[len(assigned)]]])
+
+                    assigned_ids = assigned.index.to_list()
+                    assigned_pop = assigned['Calibrated_pop'].sum()
+
+                    # Assign each row to its winning tech within the group
+                    self.gdf.loc[assigned_ids, result_tech] = assigned[result_tech]
+                    self.gdf.loc[assigned_ids, result_value] = assigned[result_value]
+                    self.gdf.loc[assigned_ids, 'technology_option'] = 1
+                    unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)]
+                    tech_target_pop[group_name] -= assigned_pop
+                    # remove consumed group share from unassigned dict so tech-level loop ignores group key
+                    if tech_target_pop[group_name] <= 0:
+                        tech_target_pop[group_name] = -999
+
+                # Clean up invalid group entries
+                tech_target_pop_unassigned = {k: v for k, v in tech_target_pop.items() if v > 0 and k not in (tech_groups or {}).keys()}
+            else:
+                tech_target_pop_unassigned = tech_target_pop.copy()
+
+            if prioritize:
+                print(f'Prioritizing technology shares in {region} areas.\n')
+                if region == 'Urban':
+                    priority = ['Electricity', 'Biogas']
+                else:
+                    priority = ['Biogas', 'Electricity']
+
+                for tech in priority:
+                    if tech not in tech_target_pop_unassigned:
+                        continue  
+
+                    pop_unassigned = tech_target_pop_unassigned[tech]
+                    print(f'Prioritizing {tech}.\n')
+
+                    col = [f'{target}_{tech}']
+                    target_pop_assign = pop_unassigned
+
+                    condition = self.gdf.loc[isurban, result_tech].isna()
+                    available_cells = self.gdf.loc[condition & isurban].copy()
+                    if len(available_cells) == 0:
+                        tech_target_pop_unassigned[tech] = -999
+                        print('No available cells to assign, since this is the last technology to be assigned, i.e. worst technology.\n')
+                        continue
+
+                    if target == 'net_benefit':
+                        available_cells[result_tech] = available_cells[col].idxmax(axis=1).astype('string')
+                    elif target == 'cost_income_ratio':
+                        available_cells[result_tech] = available_cells[col].idxmin(axis=1).astype('string')
+                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+
+                    if target == 'net_benefit':
+                        available_cells[result_value] = available_cells[col].max(axis=1)
+                    elif target == 'cost_income_ratio':
+                        available_cells[result_value] = available_cells[col].min(axis=1)
+
+                    condition = (available_cells[result_tech] == tech)
+                    candidates = available_cells.loc[condition]
+                    if len(candidates) == 0:
+                        if available_cells[f'{target}_{tech}'].isna().all():
+                            tech_target_pop_unassigned[tech] = -999
+                            print('No candidates to assign, since remaining cells are unavailable for this technology.\n')
+                        else:
+                            print(f'No candidates to assign as prioritized technology.\n')
+                        continue
+
+                    candidates = candidates.sort_values(result_value, ascending=False)
+                    candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                    assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign]
+                    if candidates['Calibrated_pop'].sum() > target_pop_assign:
+                        len_assigned = [len(assigned)]
+                        assigned = pd.concat([assigned, candidates.iloc[len_assigned]])
+                        print('Share completed assigned plus one cell.')
+
+                    assigned_ids = assigned.index.to_list()
+                    assigned_pop = assigned['Calibrated_pop'].sum()
+
+                    self.gdf.loc[assigned_ids, result_tech] = tech
+                    self.gdf.loc[assigned_ids, result_value] = assigned[result_value]
+                    self.gdf.loc[assigned_ids, 'technology_option'] = 1
+                    unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)]
+                    tech_target_pop_unassigned[tech] -= assigned_pop
+                    print(f'Assigned population to {tech}: ', f"{assigned_pop:.2f}", 'Remaining population: ', f"{tech_target_pop_unassigned[tech]:.2f}\n")
+
+                tech_target_pop_unassigned = {k: v for k, v in tech_target_pop_unassigned.items() if v > 0}
+                
+            i = 1
+            while len(tech_target_pop_unassigned) > 0:
+                cols = [f'{target}_{tech}' for tech in tech_target_pop_unassigned]
+                for tech, pop_unassigned in tech_target_pop_unassigned.items():
+                    print(f'Assigning {tech} with target population: ', f"{pop_unassigned:.2f}", f'Attempt as #{i} best technology for the target {target}.')
+                    target_pop_assign = pop_unassigned
+
+                    condition = self.gdf.loc[isurban, result_tech].isna()
+                    available_cells = self.gdf.loc[condition & isurban].copy() # Selects the cells that are available to be assigned a technology.
+                    if len(available_cells) == 0:
+                        tech_target_pop_unassigned[tech] = -999
+                        print('No available cells to assign, since this the last technology to be assigned, i.e. worst technology.\n')
+                        continue
+                    if target == 'net_benefit':
+                        available_cells[result_tech] = available_cells[cols].idxmax(axis=1).astype('string') # Gets the technology with the maximum net benefit for the unassigned candidates.
+                    elif target == 'cost_income_ratio':
+                        available_cells[result_tech] = available_cells[cols].idxmin(axis=1).astype('string')
+                    available_cells[result_tech] = available_cells[result_tech].str.replace(f"{target}_", "")
+                    if target == 'net_benefit':
+                        available_cells[result_value] = available_cells[cols].max(axis=1) # Gets the maximum net benefit for the available cells.
+                    elif target == 'cost_income_ratio':
+                        available_cells[result_value] = available_cells[cols].min(axis=1)
+
+                    condition = (available_cells[result_tech] == tech)
+                    candidates = available_cells.loc[condition]
+                    if len(candidates) == 0:
+                        if available_cells[f'{target}_{tech}'].isna().all():
+                            tech_target_pop_unassigned[tech] = -999
+                            print('No candidates to assign, since remaining cells are unavailable for this technology.\n')
+                            continue
+                        else:
+                            print(f'No candidates to assign as #{i} best option.\n')
+                            continue
+                    if target == 'net_benefit':
+                        candidates = candidates.sort_values(result_value, ascending=False)
+                    elif target == 'cost_income_ratio':
+                        candidates = candidates.sort_values(result_value, ascending=False) # ascending = True, depends on the question being asked regarding affordability.
+                    candidates['cummulative_pop'] = candidates['Calibrated_pop'].cumsum()
+
+                    assigned = candidates[candidates['cummulative_pop'] <= target_pop_assign] # Selects the candidates that are below the target population.
+                    if candidates['Calibrated_pop'].sum() > target_pop_assign:
+                        len_assigned = [len(assigned)]
+                        assigned = pd.concat([assigned, candidates.iloc[len_assigned]])
+                        print('Share completed assigned plus one cell.')
+                    assigned_ids = assigned.index.to_list() # Gets the ids of the assigned candidates.
+                    assigned_pop = assigned['Calibrated_pop'].sum() # Gets the population of the assigned candidates.
+
+                    self.gdf.loc[assigned_ids, result_tech] = tech # Assigns the technology to the assigned candidates.
+                    self.gdf.loc[assigned_ids, result_value] = assigned[result_value] # Assigns the maximum net benefit to the assigned candidates.
+                    self.gdf.loc[assigned_ids, 'technology_option'] = i
+                    unassigned_ids = unassigned_ids[~unassigned_ids.isin(assigned_ids)] # Updates the unassigned ids.
+                    tech_target_pop_unassigned[tech] -= assigned_pop # Updates the target population of the technology.
+                    print(f'Assigned population to {tech}: ', f"{assigned_pop:.2f}", 'Remaining population: ', f"{tech_target_pop_unassigned[tech]:.2f}\n")
+
+                tech_target_pop_unassigned = {k: v for k, v in tech_target_pop_unassigned.items() if v > 0}
+                i += 1
+
+            print(f'Shares after assignment attempt for {region} areas.', self.gdf.loc[isurban].groupby(result_tech)['Calibrated_pop'].sum() / self.gdf.loc[isurban, 'Calibrated_pop'].sum())
+
+            if len(unassigned_ids) > 0:
+                condition = self.gdf[result_tech].isna() # Masks the gdf to see rows where the technology is available and hasn't been assigned a technology yet.
+                self.gdf.loc[condition, result_tech] = 'None'
+
+        print('\nFinal shares ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
+
+        if clear_none:
+            print(f'\nClearing None assignments by assigning the best available technology for the {target} target.')
+            are_none = self.gdf[self.gdf[result_tech] == 'None'].copy()
+            value_cols = [col for col in self.gdf.columns if col.startswith(f'{target}_')]
+            
+            # Get corresponding net_benefit columns to check for positive values
+            net_benefit_cols = [col.replace('cost_income_ratio_', 'net_benefit_') if 'cost_income_ratio_' in col else col 
+                               for col in value_cols]
+            
+            # Only consider technologies where net_benefit > 0 (restrictions already set NaN for negative benefits earlier)
+            # Additional filter: explicitly check net_benefit > 0
+            for val_col, net_col in zip(value_cols, net_benefit_cols):
+                if net_col in self.gdf.columns:
+                    # Set to NaN where net_benefit is not positive (includes NaN and <=0)
+                    are_none.loc[~(are_none[net_col] > 0), val_col] = np.nan
+            
+            if target == 'net_benefit':
+                are_none[result_tech] = are_none[value_cols].idxmax(axis=1).astype('string')
+                are_none[result_value] = are_none[value_cols].max(axis=1)
+            elif target == 'cost_income_ratio':
+                are_none[result_tech] = are_none[value_cols].idxmin(axis=1).astype('string')
+                are_none[result_value] = are_none[value_cols].min(axis=1)
+            
+            are_none[result_tech] = are_none[result_tech].str.replace(f"{target}_", "")
+
+            assigned_ids = are_none.index.to_list()
+            self.gdf.loc[assigned_ids, result_tech] = are_none[result_tech].values
+            self.gdf.loc[assigned_ids, result_value] = are_none[result_value].values
+            self.gdf.loc[assigned_ids, 'technology_option'] = i
+            print('Final shares after clearing None assignments ', self.gdf.groupby(result_tech)['Calibrated_pop'].sum() / self.gdf['Calibrated_pop'].sum())
+            
+        if target == 'cost_income_ratio':
+            self.gdf['maximum_net_benefit'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[result_tech] == tech_name
+                net_ben_col = f'net_benefit_{tech_name}'
+                if net_ben_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'maximum_net_benefit'] = self.gdf.loc[mask, net_ben_col]
+        elif target == 'net_benefit':
+            self.gdf['most_affordable_cost_income_ratio'] = np.nan
+            for tech_name in self.gdf[result_tech].dropna().unique():
+                if tech_name == 'None':
+                    continue
+                mask = self.gdf[result_tech] == tech_name
+                cost_ratio_col = f'cost_income_ratio_{tech_name}'
+                if cost_ratio_col in self.gdf.columns:
+                    self.gdf.loc[mask, 'most_affordable_cost_income_ratio'] = self.gdf.loc[mask, cost_ratio_col]
+
+
     def _add_admin_names(self, admin, column_name):
         if isinstance(admin, str):
             admin = gpd.read_file(admin)
@@ -2462,7 +2936,7 @@ class OnStove(DataProcessor):
         
         
         
-    def income_estimation(self, income_data: str = None, pareto_weight: float = 0.32):
+    def income_estimation(self, awe: bool = True, income_data: str = None, pareto_weight: float = 0.32):
         """Estimates income of each cell in the study area.
 
         The function approaches income estimation in two possible ways. When income data is provided, it is used to simply interpolate income values
@@ -2500,47 +2974,48 @@ class OnStove(DataProcessor):
 
         # First estimating the distributions
 
-        gdp_pc = self.specs['gdp_pc']
-        gini = self.specs['gini']
+        if awe:
+            gdp_pc = self.specs['gdp_pc']
+            gini = self.specs['gini']
 
-        alpha_pareto = ((1+gini)/(2*gini))
-        xm_pareto = (1-(1/alpha_pareto))*gdp_pc
+            alpha_pareto = ((1+gini)/(2*gini))
+            xm_pareto = (1-(1/alpha_pareto))*gdp_pc
 
-        x_values = np.linspace(0, 5 * gdp_pc, 1000)  # Mock values to create the distributions
-                                                    # High income values captured by 5 times GPDpc, ASUMPTION
+            x_values = np.linspace(0, 5 * gdp_pc, 1000)  # Mock values to create the distributions
+                                                        # High income values captured by 5 times GPDpc, ASUMPTION
 
-        dist_pareto = stats.pareto(b=alpha_pareto, scale=xm_pareto)
-        cdf_pareto = dist_pareto.cdf(x_values)
-    
-        # Lognormal distribution
-    
-        sigma_lognorm = np.sqrt(2)*stats.norm.ppf((gini+1)/2)
-        mu_lognorm = np.log(gdp_pc)-((sigma_lognorm**2)/2)
-    
-        dist_lognorm = stats.lognorm(s=sigma_lognorm, scale=np.exp(mu_lognorm))
-        cdf_lognorm = dist_lognorm.cdf(x_values)
-
-        # Combined Distribution
-
-        w_pareto = pareto_weight
-        w_lognorm = 1 - w_pareto
-
-        cdf_combined = w_pareto * cdf_pareto + w_lognorm * cdf_lognorm
-
-        # Interpolation ICDF
-
-        icdf = PchipInterpolator(cdf_combined, x_values)
-        n = len(self.gdf)
-        probs = np.linspace(1/n, 1, n)          
-        icdf = icdf(probs)
-
-        #Calculating AWE
-
-        self.gdf = self.gdf.sort_values(by=['relative_wealth'], ascending=True)
+            dist_pareto = stats.pareto(b=alpha_pareto, scale=xm_pareto)
+            cdf_pareto = dist_pareto.cdf(x_values)
         
-        self.gdf["icdf"] = icdf
-        sum_icdf = np.sum(self.gdf['icdf'])
-        self.gdf['absolute_wealth'] = self.gdf['icdf']*gdp_pc*n/sum_icdf
+            # Lognormal distribution
+        
+            sigma_lognorm = np.sqrt(2)*stats.norm.ppf((gini+1)/2)
+            mu_lognorm = np.log(gdp_pc)-((sigma_lognorm**2)/2)
+        
+            dist_lognorm = stats.lognorm(s=sigma_lognorm, scale=np.exp(mu_lognorm))
+            cdf_lognorm = dist_lognorm.cdf(x_values)
+
+            # Combined Distribution
+
+            w_pareto = pareto_weight
+            w_lognorm = 1 - w_pareto
+
+            cdf_combined = w_pareto * cdf_pareto + w_lognorm * cdf_lognorm
+
+            # Interpolation ICDF
+
+            icdf = PchipInterpolator(cdf_combined, x_values)
+            n = len(self.gdf)
+            probs = np.linspace(1/n, 1, n)          
+            icdf = icdf(probs)
+
+            #Calculating AWE
+
+            self.gdf = self.gdf.sort_values(by=['relative_wealth'], ascending=True)
+            
+            self.gdf["icdf"] = icdf
+            sum_icdf = np.sum(self.gdf['icdf'])
+            self.gdf['absolute_wealth'] = self.gdf['icdf']*gdp_pc*n/sum_icdf
 
         if income_data and income_data.strip():
             self.income_data = True
@@ -2607,16 +3082,28 @@ class OnStove(DataProcessor):
             dff = self.gdf
         height, width = RasterLayer.shape_from_cell(bounds, cell_height, cell_width)
         transform = rasterio.transform.from_bounds(*bounds, width, height)
+        # drop duplicate geometries to avoid duplicate row/col computations
         geometry = dff["geometry"].apply(lambda geom: geom.wkb)
         gdf = dff.loc[geometry.drop_duplicates().index]
+
+        # compute row/col and ensure integer type
         rows, cols = rasterio.transform.rowcol(transform, gdf['geometry'].x, gdf['geometry'].y)
-        self.rows = np.array(rows)
-        self.cols = np.array(cols)
+        rows = np.array(rows, dtype=int)
+        cols = np.array(cols, dtype=int)
+
+        # clip to valid index range [0, height-1] / [0, width-1] to avoid out-of-bounds
+        if rows.size:
+            rows = np.clip(rows, 0, max(0, int(height) - 1))
+        if cols.size:
+            cols = np.clip(cols, 0, max(0, int(width) - 1))
+
+        self.rows = rows
+        self.cols = cols
         self.base_layer = self._empty_raster_from_shape(self.gdf.crs, transform, height, width)
 
     def create_layer(self, variable: str, name: Optional[str] = None,
                      labels: Optional[dict[str, str]] = None, cmap: Optional[dict[str, str]] = None,
-                     metric: str = 'mean', 
+                     metric: str = 'mean', scaling_factor: int = 1,
                      nodata: Optional[Union[float, int]] = None) -> tuple[RasterLayer, dict[int, str], dict[int, str]]:
         """Creates a :class:`RasterLayer` from a column of the main GeoDataFrame (:attr:`gdf`).
 
@@ -2684,6 +3171,9 @@ class OnStove(DataProcessor):
             * ``total``: the total value of the data accounting for all households in the cell.
             * ``per_100k``: the values are calculated per 100 thousand population withing each cell.
             * ``per_household``: average value per househol in each cell.
+        scaling_factor: int, default 1
+            Factor to divide the units of the data and change scale. For example, to change from grams to tons use
+            `scaling_factor=1.000`.
         nodata: float or int
             Defines nodata values to be ignored by the function.
 
@@ -2707,7 +3197,7 @@ class OnStove(DataProcessor):
         if isinstance(self.gdf[variable].iloc[0], str):
             if isinstance(labels, dict):
                 dff = self._re_name(dff, labels, variable)
-            dff[variable] += ' {} '.format(self.tech_separator)
+            dff[variable] = dff[variable].astype(str) + ' {} '.format(self.tech_separator)
             dff = dff.groupby('index').agg({variable: 'sum', 'geometry': 'first'})
             dff[variable] = [s[0:len(s) - (len(self.tech_separator) + 2)] for s in dff[variable]]
             if isinstance(labels, dict):
@@ -2771,15 +3261,83 @@ class OnStove(DataProcessor):
         if name is not None:
             variable = name
         raster = RasterLayer('Output', variable)
-        raster.data = layer
+        raster.data = layer / scaling_factor
         raster.meta = meta
 
         return raster, codes, cmap
 
+    def to_gpkg(self, name: str, variable: Union[str,dict[str, str]],
+               labels: Optional[dict[str, str]] = None,
+               cmap: Optional[dict[str, str]] = None,
+               metric: str = 'mean', scaling_factor: int = 1,
+               nodata: Optional[Union[float, int]] = None,
+               mask: bool = False,
+               mask_nodata: Optional[Union[float, int]] = None,
+               append_subdataset: bool = False):
+        """Creates a RasterLayer and saves it as a ``.gpkg`` file.
+
+        Parameters
+        ----------
+        name: str
+            name of the geopackage.
+        variable: str
+            The column name from the :attr:`gdf` to use.
+        labels: dictionary of str key-value pairs, optional
+            Dictionary with the keys-value pairs to use for the data categories. It is only used for categorical data---
+            see :meth:`create_layer`.
+        cmap: dictionary of str key-value pairs, optional
+            Dictionary with the colors to use for each data category. It is only used for categorical data---see
+            :meth:`create_layer`.
+        metric: str, default 'mean'
+            Metric to use to aggregate data. It is only used for non-categorical data. For available metrics see
+            :meth:`create_layer`.
+        scaling_factor: int, default 1
+            Factor to divide the units of the data and change scale. For example, to change from grams to tons use
+            `scaling_factor=1.000`.
+        nodata: float or int
+            Defines nodata values to be ignored by the function.
+        """
+        if isinstance(variable, dict):
+            var_name = variable.keys()[0]
+            save_name = variable.values()[0]
+        else:
+            var_name = variable
+            save_name = variable
+        raster, codes, cmap = self.create_layer(var_name, labels=labels, cmap=cmap, metric=metric, nodata=nodata,
+                                                scaling_factor=scaling_factor)
+        raster.meta['nodata'] = nodata
+        if mask:   
+            raster.meta['nodata'] = mask_nodata
+            raster.mask(self.mask_layer)
+        raster.save(os.path.join(self.output_directory, name), name=save_name, type='gpkg', append_subdataset=append_subdataset)
+        if codes and cmap:
+            with open(os.path.join(self.output_directory, f'{variable}ColorMap.clr'), 'w') as f:
+                for label, code in codes.items():
+                    r = int(to_rgb(cmap[code])[0] * 255)
+                    g = int(to_rgb(cmap[code])[1] * 255)
+                    b = int(to_rgb(cmap[code])[2] * 255)
+                    f.write(f'{code} {r} {g} {b} 255 {label}\n')
+
+            fields = ['KEY', 'VALUE']
+
+            csv_file = os.path.join(self.output_directory, "Categories.csv")
+            # Open the CSV file with write permission
+            with open(csv_file, "w", newline="") as csvfile:
+                # Create a CSV writer using the field/column names
+                writer = csv.DictWriter(csvfile, fieldnames=fields)
+
+                # Write the header row (column names)
+                writer.writeheader()
+
+                # Write the data
+                writer.writerow({'KEY': 0, 'VALUE': '0: None'})
+                for value, key in codes.items():
+                    writer.writerow({'KEY': key, 'VALUE': f'{key}: {value}'})
+
     def to_raster(self, variable: str,
                   labels: Optional[dict[str, str]] = None,
                   cmap: Optional[dict[str, str]] = None,
-                  metric: str = 'mean',
+                  metric: str = 'mean', scaling_factor: int = 1,
                   nodata: Optional[Union[float, int]] = None,
                   mask: bool = False,
                   mask_nodata: Optional[Union[float, int]] = None):
@@ -2798,10 +3356,14 @@ class OnStove(DataProcessor):
         metric: str, default 'mean'
             Metric to use to aggregate data. It is only used for non-categorical data. For available metrics see
             :meth:`create_layer`.
+        scaling_factor: int, default 1
+            Factor to divide the units of the data and change scale. For example, to change from grams to tons use
+            `scaling_factor=1.000`.
         nodata: float or int
             Defines nodata values to be ignored by the function.
         """
-        raster, codes, cmap = self.create_layer(variable, labels=labels, cmap=cmap, metric=metric, nodata=nodata)
+        raster, codes, cmap = self.create_layer(variable, labels=labels, cmap=cmap, metric=metric, nodata=nodata,
+                                                scaling_factor=scaling_factor)
         if mask:
             raster.meta['nodata'] = mask_nodata
             raster.mask(self.mask_layer)
@@ -2831,7 +3393,7 @@ class OnStove(DataProcessor):
                 for value, key in codes.items():
                     writer.writerow({'KEY': key, 'VALUE': f'{key}: {value}'})
 
-    def plot(self, variable: str, metric='mean',
+    def plot(self, variable: str = 'max_benefit_tech', metric='mean',
              labels: Optional[dict[str, str]] = None,
              cmap: Union[dict[str, str], str] = 'viridis',
              cumulative_count: Optional[tuple[float, float]] = None,
@@ -2842,6 +3404,8 @@ class OnStove(DataProcessor):
              legend: bool = True, legend_title: str = '', legend_cols: int = 1,
              legend_position: tuple[float, float] = (1.02, 0.6),
              legend_prop: Optional[dict] = None,
+             colorbar: bool = True,
+             colorbar_kwargs: Optional[dict] = None,
              stats: bool = False,
              stats_kwargs: Optional[dict] = None,
              scale_bar: Optional[dict] = None, north_arrow: Optional[dict] = None,
@@ -3063,7 +3627,8 @@ class OnStove(DataProcessor):
                          categories=codes, legend_position=legend_position,
                          admin_layer=admin_layer, title=title, legend=legend,
                          legend_title=legend_title, legend_cols=legend_cols, rasterized=rasterized,
-                         ax=ax, legend_prop=legend_prop, scale_bar=scale_bar, north_arrow=north_arrow)
+                         ax=ax, legend_prop=legend_prop, colorbar=colorbar, 
+                         colorbar_kwargs=colorbar_kwargs, scale_bar=scale_bar, north_arrow=north_arrow)
 
         if save_style:
             if codes:
@@ -3080,7 +3645,7 @@ class OnStove(DataProcessor):
 
         return ax
 
-    def _add_statistics(self, ax, variable='max_benefit_tech', kwargs: Optional[dict] = None):
+    def _add_statistics(self, ax, variable: str ='max_benefit_tech', kwargs: Optional[dict] = None):
         _kwargs = {'extra_stats': None, 'stats_position': (1.02, 0.9), 'pad': 0, 'sep': 6,
                    'fontsize': 10, 'fontcolor': 'black', 'fontweight': 'normal',
                    'box_props': dict(boxstyle='round', facecolor='#f1f1f1ff', edgecolor='lightgray')}
@@ -3323,16 +3888,22 @@ class OnStove(DataProcessor):
         pd.DataFrame
             A dataframe containing the summary information grouped by the selected `variable`.
         """
+        if variable == 'max_benefit_tech':
+            label = 'Max benefit technology'
+            variable_value = 'maximum_net_benefit'
+        elif variable == 'most_affordable_tech':
+            label = 'Most affordable technology'
+            variable_value = 'most_affordable_cost_income_ratio'
         dff = self.gdf.copy()
         if labels is not None:
             dff = self._re_name(dff, labels, variable)
-        for attribute in ['maximum_net_benefit', 'deaths_avoided', 'health_costs_avoided', 'time_saved',
+        for attribute in [variable_value, 'deaths_avoided', 'health_costs_avoided', 'time_saved',
                           'opportunity_cost_gained', 'reduced_emissions', 'emission_costs_avoided',
                           'investment_costs', 'fuel_costs', 'om_costs', 'salvage_value']:
             dff[attribute] *= dff['Households']
         summary = dff.groupby([variable]).agg({'Calibrated_pop': lambda row: np.nansum(row) / 1000000,
                                                          'Households': lambda row: np.nansum(row) / 1000000,
-                                                         'maximum_net_benefit': lambda row: np.nansum(row) / 1000000,
+                                                         variable_value: lambda row: np.nansum(row) / 1000000,
                                                          'deaths_avoided': 'sum',
                                                          'health_costs_avoided': lambda row: np.nansum(row) / 1000000,
                                                          'time_saved': 'sum',
@@ -3355,10 +3926,10 @@ class OnStove(DataProcessor):
 
         summary['time_saved'] /= (summary['Households'] * 1000000 * 365)
         if pretty:
-            summary.rename(columns={variable: 'Max benefit technology',
+            summary.rename(columns={variable: label,
                                     'Calibrated_pop': 'Population (Million)',
                                     'Households': 'Households (Millions)',
-                                    'maximum_net_benefit': 'Total net benefit (MUSD)',
+                                    variable_value: 'Total net benefit (MUSD)',
                                     'deaths_avoided': 'Total deaths avoided (pp/yr)',
                                     'health_costs_avoided': 'Health costs avoided (MUSD)',
                                     'time_saved': 'hours/hh.day',
@@ -3718,7 +4289,7 @@ class OnStove(DataProcessor):
                               **_kwargs
                               )
              + scale_fill_manual(cmap)
-             + scale_color_manual(cmap, guide=False)
+             + scale_color_manual(cmap, guide=None)
              + theme_name
              + theme(text=element_text(**_font_args))
              + wrap
@@ -3780,7 +4351,7 @@ class OnStove(DataProcessor):
                               **kwargs
                               )
              + scale_fill_manual(cmap)
-             + scale_color_manual(cmap, guide=False)
+             + scale_color_manual(cmap, guide=None)
              + theme_minimal()
              + theme(text=element_text(**font_args))
              + labs(x=x_title, y=y_title, fill='Cooking technology')
@@ -3795,10 +4366,13 @@ class OnStove(DataProcessor):
         line1 = geom_vline(xintercept=q1, color="#4D4D4D", size=0.8, linetype="dashed")
         line3 = geom_vline(xintercept=q3, color="#4D4D4D", size=0.8, linetype="dashed")
 
-        hist = hist + line1 + line3
+        plot = hist + line1 + line3
 
-        # get figure to annotate
-        fig = hist.draw()  # get the matplotlib figure object
+        fig = plot.draw()  # get the matplotlib figure object
+        for ax in fig.axes:
+            for im in ax.images:
+                if hasattr(im.get_array(), "setflags"):
+                    im.get_array().setflags(write=True)
         plt.close()
         ax = fig.axes[0]  # get the matplotlib axes (more than one if faceted)
 
@@ -3923,7 +4497,11 @@ class OnStove(DataProcessor):
             Figure object used to plot the distribution
         """
         if best_mix:
-            df = self.gdf[[fill, 'Calibrated_pop', 'Households', 'maximum_net_benefit',
+            if fill == 'max_benefit_tech':
+                fill_value = 'maximum_net_benefit'
+            elif fill == 'most_affordable_tech':
+                fill_value = 'most_affordable_cost_income_ratio'
+            df = self.gdf[[fill, 'Calibrated_pop', 'Households', fill_value,
                            'health_costs_avoided', 'opportunity_cost_gained', 'emission_costs_avoided',
                            'investment_costs', 'salvage_value', 'fuel_costs', 'om_costs', 
                            'relative_wealth', 'value_of_time']].copy()
@@ -4016,7 +4594,7 @@ class OnStove(DataProcessor):
         if groupby.lower() == 'urbanrural':
             p += labs(x='Settlement')
         else:
-            p += theme(legend_position="none")
+            p += theme(legend_position=None)
 
         if quantiles:
             p = self._plot_quantiles(p, x_variable=x, y_variable='Households')
@@ -4033,6 +4611,101 @@ class OnStove(DataProcessor):
 
         return p
 
+    def plot_affordability(self, fuel: str, labels: Optional[dict[str, str]] = None, title: str = None,
+                           cmap: Optional[dict[str, str]] = 'viridis', legend_title: Optional[str] = None,
+                           ax: Optional['matplotlib.axes.Axes'] = None,
+                           bar_variable: str = 'Households',
+                           categories: list = [],
+                           colors: list = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424', 'grey', '#5a5a5a'],
+                           dpi: float = 150, save_as: Optional[str] = None, filter_allocated: bool = False,
+                           allocation_column: str = None) -> matplotlib.axes.Axes:
+        """Expands map plotting function specifically for affordability maps."""
+        variable = f'affordability_category_{fuel}'
+        original_series = self.gdf[variable].copy()
+        try:
+            working_series = original_series.copy()
+
+            if filter_allocated:
+                if allocation_column is None:
+                    if 'most_affordable_tech' in self.gdf.columns:
+                        allocation_column = 'most_affordable_tech'
+                    elif 'max_benefit_tech' in self.gdf.columns:
+                        allocation_column = 'max_benefit_tech'
+                    else:
+                        raise ValueError("Could not find allocation column. Please specify allocation_column parameter.")
+
+                # Ensure 'Not allocated' exists in categorical series before assignment
+                if pd.api.types.is_categorical_dtype(working_series) and 'Not allocated' not in working_series.cat.categories:
+                    working_series = working_series.cat.add_categories(['Not allocated'])
+
+                not_allocated_mask = self.gdf[allocation_column] != fuel
+                numeric_mask = working_series.notna() & (working_series.astype(str) != 'Not available')
+                working_series.loc[not_allocated_mask & numeric_mask] = 'Not allocated'
+
+            base_categories = list(next(iter(self.techs.values())).categories or [])
+            grad_categories = [c for c in base_categories if c not in ('Not available', 'Not allocated')]
+            categories = grad_categories + ['Not available'] + (['Not allocated'] if filter_allocated else [])
+
+            if pd.api.types.is_categorical_dtype(working_series):
+                working_series = working_series.astype('category')
+                needed = [c for c in categories if c not in working_series.cat.categories]
+                if needed:
+                    working_series = working_series.cat.add_categories(needed)
+            self.gdf[variable] = working_series
+
+            # Build color map: gradient across numeric categories; greys for statuses
+            if not colors:
+                colors = ['#51a655', '#b8ec61', '#dbec61', '#ecdd61', '#ecb661', '#ec8c61', '#f02424']
+            # filter out greys in case they were included
+            grad_base = [c for c in colors if str(c).lower() not in ['grey', '#808080', '#5a5a5a']]
+            if len(grad_base) < 2:
+                grad_base = ['#51a655', '#f02424']
+            grad_cmap = LinearSegmentedColormap.from_list('aff_grad', grad_base)
+            n_grad = max(len(grad_categories), 1)
+            grad_color_list = [to_hex(grad_cmap(v)) for v in np.linspace(0, 1, n_grad)]
+
+            cmap = {cat: col for cat, col in zip(grad_categories, grad_color_list)}
+            cmap['Not available'] = '#b0b0b0'  # lighter grey for availability status
+            if filter_allocated:
+                cmap['Not allocated'] = '#5a5a5a'  # darker grey for non-allocated
+            category_color_map = cmap
+
+            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+            self.plot(variable, cmap=cmap, ax=ax, title=title,
+                      figsize=(16, 9), legend=False, legend_title='Cost/Income ratio',
+                      legend_position=(-0.25, 1.05),
+                      legend_prop={'title': {'size': 10, 'weight': 'bold'}, 'size': 9},
+                      stats=False, rasterized=True, dpi=300)
+
+            counts = self.gdf.groupby(variable, observed=False)[bar_variable].sum().pipe(lambda x: x / x.sum()).sort_index()
+            counts = counts.reindex(categories).fillna(0)
+            labels = counts.index
+            values = counts.values
+            bar_colors = [category_color_map[label] for label in labels]
+
+            axins = inset_axes(ax, width="20%", height="20%", loc='lower left', borderpad=1.5)
+            bars = axins.bar(labels, values, color=bar_colors, edgecolor='black')
+            axins.set_title(f'{bar_variable} share', fontsize=8)
+            axins.set_ylim(0, 1)
+            axins.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0%}"))
+            axins.tick_params(axis='x', labelrotation=45, labelsize=7)
+            axins.tick_params(axis='y', labelsize=7)
+
+            for bar in bars:
+                yval = bar.get_height()
+                axins.text(bar.get_x() + bar.get_width()/2, yval + 0.025, f"{yval:.0%}",
+                           ha='center', fontsize=6)
+
+            if isinstance(save_as, str):
+                path = os.path.join(self.output_directory, 'Cost_income')
+                os.makedirs(path, exist_ok=True)
+                plt.savefig(os.path.join(path, save_as), dpi=dpi, bbox_inches='tight', transparent=True)
+        finally:
+            self.gdf[variable] = original_series
+
+        return ax
+    
     def to_csv(self, name: str):
         """Saves the main GeoDataFrame :attr:`gdf` as a ``.csv`` file into the :attr:`output_directory`.
 
@@ -4050,3 +4723,170 @@ class OnStove(DataProcessor):
 
         df = pd.DataFrame(pt.drop(columns='geometry'))
         df.to_csv(name, index=False)
+
+    def subset_by_country(self,
+                          country_code: Optional[str] = None,
+                          country_gdf: Optional['gpd.GeoDataFrame'] = None,
+                          country_col: str = 'country',
+                          in_place: bool = False) -> 'OnStove':
+        """
+        Return (or modify in_place) an OnStove instance filtered to the given country.
+        - country_code: value found in self.gdf[country_col]
+        - country_gdf: geopandas.GeoDataFrame providing polygon(s) to spatially select cells (no BaseGeometry import)
+        Preserves original dtypes for attributes and crops 2D rasters when possible.
+        """
+
+        if country_code is None and country_gdf is None:
+            raise ValueError("Provide country_code or country_gdf")
+
+        # build boolean mask on original gdf
+        if country_code is not None:
+            mask = self.gdf[country_col] == country_code
+        else:
+            if not isinstance(country_gdf, gpd.GeoDataFrame):
+                raise ValueError("country_gdf must be a geopandas.GeoDataFrame")
+            # dissolve to single geometry then intersect
+            geom = country_gdf.unary_union
+            mask = self.gdf.geometry.intersects(geom)
+
+        if mask.sum() == 0:
+            raise ValueError("No rows match the given country filter")
+
+        original_len = len(self.gdf)
+        mask_arr = mask.to_numpy()
+
+        target = self if in_place else copy.deepcopy(self)
+
+        # subset gdf and reset index
+        target.gdf = self.gdf.loc[mask].copy().reset_index(drop=True)
+
+        # get original full-grid shape (height, width) from base_layer if available
+        grid_shape = None
+        if hasattr(self, 'base_layer') and getattr(self, 'base_layer') is not None:
+            try:
+                # RasterLayer.meta uses width/height or data.shape
+                if hasattr(self.base_layer, 'data') and getattr(self.base_layer, 'data') is not None:
+                    grid_shape = tuple(self.base_layer.data.shape)
+                elif isinstance(self.base_layer, dict) or isinstance(self.base_layer, object):
+                    meta = getattr(self.base_layer, 'meta', None)
+                    if meta is not None and 'height' in meta and 'width' in meta:
+                        grid_shape = (meta['height'], meta['width'])
+            except Exception:
+                grid_shape = None
+
+        # compute crop window if original 'row' and 'col' columns present in original gdf and we have grid_shape
+        if {'row', 'col'}.issubset(self.gdf.columns) and grid_shape is not None:
+            sel_rows = self.gdf.loc[mask, 'row'].astype(int)
+            sel_cols = self.gdf.loc[mask, 'col'].astype(int)
+            r0, r1 = int(sel_rows.min()), int(sel_rows.max())
+            c0, c1 = int(sel_cols.min()), int(sel_cols.max())
+            crop_slice = (slice(r0, r1 + 1), slice(c0, c1 + 1))
+        else:
+            crop_slice = None
+
+        # subset other attributes preserving dtypes where possible
+        for name, val in list(self.__dict__.items()):
+            if name == 'gdf':
+                continue
+            # skip non-sized attrs
+            try:
+                ln = len(val)
+            except Exception:
+                continue
+
+            # attributes aligned to per-cell length -> subset
+            if ln == original_len:
+                # pandas Series
+                if isinstance(val, pd.Series):
+                    setattr(target, name, val.loc[mask].reset_index(drop=True))
+                # pandas DataFrame: subset rows
+                elif isinstance(val, pd.DataFrame):
+                    setattr(target, name, val.loc[mask].reset_index(drop=True))
+                # numpy arrays
+                elif isinstance(val, np.ndarray):
+                    # 1D per-cell array
+                    if val.ndim == 1 and val.size == original_len:
+                        setattr(target, name, val[mask_arr].copy())
+                    # 2D raster that matches known grid shape -> crop window if available
+                    elif val.ndim == 2 and grid_shape is not None and val.shape == grid_shape and crop_slice is not None:
+                        # crop using original grid indices (crop_slice computed from original self.gdf)
+                        setattr(target, name, val[crop_slice].copy())
+                    else:
+                        # flatten and subset -> keep 1D per-cell array
+                        try:
+                            setattr(target, name, val.ravel()[mask_arr].copy())
+                        except Exception:
+                            # fallback: try boolean indexing if possible
+                            try:
+                                setattr(target, name, val[mask_arr].copy())
+                            except Exception:
+                                pass
+                else:
+                    # try generic indexing for sequence-like objects
+                    try:
+                        new_seq = type(val)(val[i] for i, m in enumerate(mask_arr) if m)
+                        setattr(target, name, new_seq)
+                    except Exception:
+                        # leave unchanged if cannot safely subset
+                        pass
+            else:
+                # handle full-grid 2D arrays with total size == original_len (rare)
+                if isinstance(val, np.ndarray) and val.size == original_len and val.ndim != 1:
+                    try:
+                        setattr(target, name, val.ravel()[mask_arr].copy())
+                    except Exception:
+                        pass
+                # else leave attribute untouched
+
+        # Rebuild base_layer and rows/cols from the subset bounds so transform/extent match the new object.
+        bounds = target.gdf.total_bounds  # (minx, miny, maxx, maxy)
+        # robustly read cell size (allow scalar or 2-tuple)
+        try:
+            cs = getattr(self, 'cell_size', None)
+            if cs is None:
+                raise ValueError("cell_size is not set")
+
+            # normalize cell_size into two floats
+            if isinstance(cs, (int, float, np.integer, np.floating)):
+                cell_w = cell_h = float(cs)
+            else:
+                # sequence-like: handle len == 1 or >=2
+                try:
+                    length = len(cs)
+                except Exception:
+                    # fallback: try to treat as scalar
+                    cell_w = cell_h = float(cs)
+                else:
+                    if length == 0:
+                        raise ValueError("cell_size sequence is empty")
+                    if length == 1:
+                        cell_w = cell_h = float(cs[0])
+                    else:
+                        cell_w = float(cs[0])
+                        cell_h = float(cs[1])
+
+            # prefer the model helper if available
+            if hasattr(target, '_base_layer_from_bounds') and callable(target._base_layer_from_bounds):
+                target._base_layer_from_bounds(bounds, cell_height=cell_h, cell_width=cell_w)
+            else:
+                # fallback: update a minimal base_layer/meta if present
+                if hasattr(target, 'base_layer') and target.base_layer is not None:
+                    try:
+                        height, width = RasterLayer.shape_from_cell(bounds, cell_h, cell_w)
+                        transform = rasterio.transform.from_bounds(*bounds, width, height)
+                        target.base_layer.data = np.empty((height, width))
+                        target.base_layer.data[:] = np.nan
+                        meta = dict(target.base_layer.meta or {})
+                        meta.update(width=width, height=height, transform=transform, crs=target.gdf.crs)
+                        target.base_layer.meta = meta
+                    except Exception:
+                        target.base_layer = None
+        except Exception:
+            # if anything goes wrong, ensure base_layer is at least cleared so plotting regenerates extent where possible
+            if hasattr(target, 'base_layer'):
+                try:
+                    target.base_layer = None
+                except Exception:
+                    pass
+
+        return target

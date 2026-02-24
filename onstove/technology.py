@@ -126,6 +126,7 @@ class Technology:
         self.benefits = None
         self.net_benefits = None
         self.gdf = gpd.GeoDataFrame()
+        self.categories = []
 
     def __setitem__(self, idx, value):
         self.__dict__[idx] = value
@@ -666,7 +667,7 @@ class Technology:
         self.time_value = self.total_time_saved * model.gdf["value_of_time"] / (
                 1 + model.specs["discount_rate"]) ** (proj_life)
 
-    def total_costs(self):
+    def total_costs(self, w_salvage=1):
         """ Calculates total costs (fuel, investment, operation and maintenance as well as salvage costs). Function does
         not return anything but saves the total costs in the `costs` attribute of the OnStove model object.
 
@@ -681,7 +682,7 @@ class Technology:
         discount_fuel_cost, discounted_om, salvage, discounted_inv
         """
         self.costs = (self.discounted_fuel_cost + self.discounted_investments +
-                      self.discounted_om_costs - self.discounted_salvage_cost)
+                      self.discounted_om_costs - w_salvage * self.discounted_salvage_cost)
         
     def affordability_categories(self, model: 'onstove.OnStove', categories: list = ['<5%', '5-15%', '15%+']):
         """Assigns the affordability categories for each stove. The affordability categories are based on the
@@ -710,14 +711,18 @@ class Technology:
         --------
         onstove.OnStove.income_estimation
         """
+        self.categories = categories
+        
         try:
             if model.income_data:
                 model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / model.gdf['income']
             else:
                 model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / model.gdf['absolute_wealth']
+            
+            model.gdf['cost_income_ratio_{}'.format(self.name)] = model.gdf['cost_income_ratio_{}'.format(self.name)].clip(lower=0)
         
             bins = [0.0]
-            for cat in categories:
+            for cat in self.categories:
                 if '<' in cat:
                     upper = float(cat.strip('<%')) / 100
                     bins.append(upper)
@@ -730,18 +735,25 @@ class Technology:
                 
                 bins = sorted(set(bins))
 
-            model.gdf['affordability_category_{}'.format(self.name)] = pd.cut(model.gdf['cost_income_ratio_{}'.format(self.name)], bins=bins, labels=categories, right=False)
+            model.gdf['affordability_category_{}'.format(self.name)] = pd.cut(model.gdf['cost_income_ratio_{}'.format(self.name)], bins=bins, labels=self.categories, right=False)
             model.gdf['affordability_category_{}'.format(self.name)] = model.gdf['affordability_category_{}'.format(self.name)].cat.add_categories(['Not available'])
-            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] > 1, 'affordability_category_{}'.format(self.name)] = categories[-1]
-            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] < 0, 'affordability_category_{}'.format(self.name)] = categories[0]
+            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] > 1, 'affordability_category_{}'.format(self.name)] = self.categories[-1]
+            model.gdf.loc[model.gdf['cost_income_ratio_{}'.format(self.name)] < 0, 'affordability_category_{}'.format(self.name)] = self.categories[0]
 
 
         except KeyError:
             raise KeyError(f"The affordability categories could not be assigned for {self.name}.")
+                    
+        affordability_target = float(self.categories[0].strip('<%')) / 100
+        if model.income_data:
+            model.gdf['affordability_support_required_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / affordability_target - model.gdf['income']
+        else:
+            model.gdf['affordability_support_required_{}'.format(self.name)] = model.gdf['costs_{}'.format(self.name)] / affordability_target - model.gdf['absolute_wealth']
+        model.gdf['affordability_support_required_{}'.format(self.name)] = model.gdf['affordability_support_required_{}'.format(self.name)].clip(lower=0)
 
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method combines all costs and benefits as specified by the user using the weights parameters. Function
         does not return anything but saves the total benefits in the `benefits` attribute of the OnStove object and the
         net-benefits in the `net-benefits` attribute of the OnStove net-benefits object.
@@ -772,12 +784,14 @@ class Technology:
          time_saved
          carbon_emissions
         """
-        self.total_costs()
+        self.total_costs(w_salvage=w_salvage)
         self.benefits = w_health * (self.distributed_morbidity + self.distributed_mortality) + \
                         w_spillovers * (self.distributed_spillovers_morb + self.distributed_spillovers_mort) + \
                         w_environment * self.decreased_carbon_costs + w_time * self.time_value
         self.net_benefits = self.benefits - w_costs * self.costs
-        model.gdf["costs_{}".format(self.name)] = self.costs
+        model.gdf["relative_costs_{}".format(self.name)] = self.costs
+        base_costs = model.base_fuel.discounted_fuel_cost + model.base_fuel.discounted_investments + model.base_fuel.om_cost
+        model.gdf["costs_{}".format(self.name)] = self.costs + base_costs
         model.gdf["benefits_{}".format(self.name)] = self.benefits
         model.gdf["net_benefit_{}".format(self.name)] = self.benefits - w_costs * self.costs
         self.factor = pd.Series(np.ones(model.gdf.shape[0]), index=model.gdf.index)
@@ -1122,7 +1136,7 @@ class LPG(Technology):
             self.discounted_investments += (self.discounted_infra_cost * (1 - self.pop_sqkm))
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account access to roads (proximity).
 
         Parameters
@@ -1147,7 +1161,7 @@ class LPG(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         if isinstance(self.roads, VectorLayer):
             dist_roads = self.roads.proximity(base_layer=model.base_layer, create_raster=False)
             dist_roads.data = dist_roads.data > self.distance_limit
@@ -1807,7 +1821,7 @@ class Electricity(Technology):
             self.discounted_investments += (self.connection_cost + self.capacity_cost * (1 - self.pop_sqkm))
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account electricity availability
         in the calculations.
 
@@ -1833,7 +1847,7 @@ class Electricity(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         model.gdf.loc[model.gdf['Current_elec'] == 0, "net_benefit_{}".format(self.name)] = np.nan
         self.net_benefits.loc[model.gdf['Current_elec'] == 0] = np.nan
         factor = model.gdf['Elec_pop_calib'] / model.gdf['Calibrated_pop']
@@ -1856,7 +1870,8 @@ class Electricity(Technology):
         """
         super().affordability_categories(model, categories = categories)
         model.gdf.loc[model.gdf['Current_elec'] == 0, 'affordability_category_{}'.format(self.name)] = 'Not available'
-
+        model.gdf.loc[model.gdf['affordability_category_{}'.format(self.name)] == 'Not available', 'affordability_support_required_{}'.format(self.name)] = np.nan
+        model.gdf.loc[model.gdf['affordability_category_{}'.format(self.name)] == 'Not available', 'cost_income_ratio_{}'.format(self.name)] = np.nan
 
 class MiniGrids(Electricity):
     """Mini-grids technology class used to model electrical stoves powered by mini-grids.
@@ -2051,7 +2066,7 @@ class MiniGrids(Electricity):
         self.discounted_investments += self.connection_cost
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
 
         """This method modifies :meth:`Electricity.net_benefit` for the mini-grid class
 
@@ -2077,7 +2092,7 @@ class MiniGrids(Electricity):
         --------
         net_benefit
         """
-        super(Electricity, self).net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super(Electricity, self).net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         self.calculate_potential(model)
         self.households = self.gdf['supported_hh']
         model.gdf.loc[self.households == 0, "net_benefit_{}".format(self.name)] = np.nan
@@ -2353,7 +2368,7 @@ class Biogas(Technology):
         self.total_time_yr += (self.manure_feed_time * 365)
 
     def net_benefit(self, model: 'onstove.OnStove', w_health: int = 1, w_spillovers: int = 1,
-                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1):
+                    w_environment: int = 1, w_time: int = 1, w_costs: int = 1, w_salvage = 1):
         """This method expands :meth:`Technology.net_benefit` by taking into account biogas availability
         in the calculations.
 
@@ -2379,7 +2394,7 @@ class Biogas(Technology):
         --------
         net_benefit
         """
-        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs)
+        super().net_benefit(model, w_health, w_spillovers, w_environment, w_time, w_costs, w_salvage)
         required_energy_hh = self.required_energy_hh(model)
         model.gdf.loc[(model.gdf['biogas_energy'] < required_energy_hh), "benefits_{}".format(self.name)] = np.nan
         model.gdf.loc[(model.gdf['biogas_energy'] < required_energy_hh), "net_benefit_{}".format(self.name)] = np.nan
@@ -2411,3 +2426,6 @@ class Biogas(Technology):
         """
         super().affordability_categories(model, categories = categories)
         model.gdf.loc[model.gdf['net_benefit_{}'.format(self.name)].isna(), 'affordability_category_{}'.format(self.name)] = 'Not available'
+        model.gdf.loc[model.gdf['affordability_category_{}'.format(self.name)] == 'Not available', 'affordability_support_required_{}'.format(self.name)] = np.nan
+        model.gdf.loc[model.gdf['affordability_category_{}'.format(self.name)] == 'Not available', 'cost_income_ratio_{}'.format(self.name)] = np.nan
+

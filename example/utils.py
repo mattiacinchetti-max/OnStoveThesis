@@ -25,11 +25,11 @@ def download_data(country):
 
     temperature = country_dict["Temp"]
     response = requests.get(temperature)
-    open(r"gis_data\Temperature\Temperature.tif", "wb").write(response.content)
+    open(r"gis_data/Temperature/Temperature.tif", "wb").write(response.content)
 
     urban = country_dict["Urban"]
     response = requests.get(urban)
-    open(r"gis_data\Urban\Urban.tif", "wb").write(response.content)
+    open(r"gis_data/Urban/Urban.tif", "wb").write(response.content)
 
     for livestock in ['buffaloes','cattles','poultry','goats','pigs','sheeps']:
         livestocks = country_dict['Livestock'][livestock]
