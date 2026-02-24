@@ -1494,8 +1494,6 @@ class RasterLayer(_Layer):
         layer, meta = align_raster(base_layer, self,
                                    method=self.resample)
         data = layer
-        meta = meta
-
         if rescale:
             data[data == meta['nodata']] = np.nan
             meta['nodata'] = np.nan
