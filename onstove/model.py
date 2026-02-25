@@ -2520,6 +2520,7 @@ class OnStove(DataProcessor):
 
                     # Pick winning tech per cell within the group based on target metric
                     if target == 'net_benefit':
+                        # TODO: to prevent idxmax from raising an error when all values are NaN, we need to filterout all rows with nans first
                         available_cells[result_tech] = available_cells[group_cols].idxmax(axis=1).astype('string')
                         available_cells[result_value] = available_cells[group_cols].max(axis=1)
                         sort_ascending = False
@@ -2585,6 +2586,7 @@ class OnStove(DataProcessor):
                         continue
 
                     if target == 'net_benefit':
+                        # TODO: to prevent idxmax from raising an error when all values are NaN, we need to filterout all rows with nans first
                         available_cells[result_tech] = available_cells[col].idxmax(axis=1).astype('string')
                     elif target == 'cost_income_ratio':
                         available_cells[result_tech] = available_cells[col].idxmin(axis=1).astype('string')
