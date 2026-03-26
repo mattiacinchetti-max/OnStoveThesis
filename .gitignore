@@ -154,5 +154,6 @@ example/*
 onstove/tests/data/*
 !onstove/tests/data/.gitkeep
 onstove/tests/output
-thesis/maps_point_filter_attract/local_tests/*
 
+
+thesis/script_nostri/dataset_big/ 
