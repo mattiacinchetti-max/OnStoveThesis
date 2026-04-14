@@ -159,3 +159,6 @@ onstove/tests/output
 
 thesis/script_nostri/dataset_big/ 
 example/NGA/
+thesis/script_nostri/_cache_border_controls
+thesis/script_nostri/cache
+thesis/script_nostri/dataset_first_step
