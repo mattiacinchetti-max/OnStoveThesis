@@ -464,11 +464,18 @@ print(f"  Pre‑compute done in {_eta(profile['timings_sec']['precompute'])}")
 # =============================================================================
 # PROCESS CHUNKS
 # =============================================================================
+# =============================================================================
+# PROCESS CHUNKS
+# =============================================================================
 print("[7/8] Processing chunks...")
 loop_t0 = time.time()
 chunk_start = 0
 processed = 0
 outlier_indices = []
+
+# Limiti massimi di sicurezza (minuti)
+MAX_WALK_LIMIT = 240.0   # 4 ore a piedi
+MAX_CAR_LIMIT = 180.0    # 3 ore in moto/auto
 
 while chunk_start < n_pix:
     chunk_end = min(chunk_start + CHUNK_SIZE, n_pix)
@@ -510,7 +517,8 @@ while chunk_start < n_pix:
 
     # Walk mode
     if n_clean > 0:
-        global_limit_walk = float(np.max(lims_w_clean)) if np.any(lims_w_clean > 0) else np.inf
+        global_limit_walk = float(np.max(lims_w_clean)) if np.any(lims_w_clean > 0) else MAX_WALK_LIMIT
+        global_limit_walk = min(global_limit_walk, MAX_WALK_LIMIT)
         tw_start = time.time()
         dist_walk = dijkstra(csgraph=graph_walk, directed=True,
                              indices=nodes_clean, limit=global_limit_walk)
@@ -547,11 +555,12 @@ while chunk_start < n_pix:
             cand_c = np.unique(np.concatenate([base, nn]))
             cands_car.append(cand_c)
             lb = np.hypot(r_rows[cand_c] - r, r_cols[cand_c] - c) * CELL_SIZE_METERS * max(moto_friction_min, EPS)
-            lim = float(np.nanmax(lb) * INITIAL_LIMIT_FACTOR_CAR + LIMIT_MARGIN_MIN) if lb.size > 0 else np.inf
-            limits_car.append(lim)
+            lim = float(np.nanmax(lb) * INITIAL_LIMIT_FACTOR_CAR + LIMIT_MARGIN_MIN) if lb.size > 0 else MAX_CAR_LIMIT
+            limits_car.append(min(lim, MAX_CAR_LIMIT))
             car_sources.append(nodes_clean[i_local])
 
-        global_limit_car = float(np.max(limits_car)) if limits_car else np.inf
+        global_limit_car = float(np.max(limits_car)) if limits_car else MAX_CAR_LIMIT
+        global_limit_car = min(global_limit_car, MAX_CAR_LIMIT)
         tc_start = time.time()
         dist_car = dijkstra(csgraph=graph_moto, directed=True,
                             indices=car_sources, limit=global_limit_car)
@@ -589,7 +598,6 @@ while chunk_start < n_pix:
         speed = processed / max(elapsed, 1e-9)
         rem = (n_pix - processed) / max(speed, 1e-9)
         print(f"  {processed:,}/{n_pix:,} ({100*processed/n_pix:.1f}%) | {speed:.1f} pix/s | ETA {_eta(rem)}")
-
 # =============================================================================
 # PROCESS OUTLIERS
 # =============================================================================
