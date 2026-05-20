@@ -2146,6 +2146,9 @@ class OnStove(DataProcessor):
             the share is treated as a single competitive pool among the group's technologies, assigned by
             the selected target metric (idxmax/idxmin) without equal pre-splitting.
 
+        improved_supply_chain: bool, default False  
+            Whether to apply the improved LPG cost logic or not
+
         See also
         --------
         set_base_fuel
@@ -2210,7 +2213,7 @@ class OnStove(DataProcessor):
             tech.required_energy(self)
             tech.discounted_om(self)
             tech.discounted_inv(self)
-            tech.discount_fuel_cost(self, improved_suppply_chain=improved_supply_chain)
+            tech.discount_fuel_cost(self, improved_supply_chain=improved_supply_chain)
             tech.salvage(self)
             print(f'Calculating net benefit for {tech.name}...\n')
             tech.net_benefit(self, self.specs['w_health'], self.specs['w_spillovers'],

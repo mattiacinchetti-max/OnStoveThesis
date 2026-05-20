@@ -613,6 +613,8 @@ class Technology:
         relative: bool, default True
             Boolean parameter to indicate if the discounted fuel cost will be calculated relative to the `base_fuel`
             or not.
+        improved_supply_chain: bool, default False
+            Boolean parameter to indicate if the fuel cost for LPG should be calculated with the improved supply chain cost (i.e. user cost) or not.
 
         See also
         --------
@@ -992,7 +994,7 @@ class LPG(Technology):
         transport_cost[transport_cost < 0] = np.nan
         self.transport_cost = transport_cost
 
-    def discount_fuel_cost(self, model: 'onstove.OnStove', relative: bool = True):
+    def discount_fuel_cost(self, model: 'onstove.OnStove', relative: bool = True, improved_supply_chain: bool = False):
         """This method expands :meth:`discount_fuel_cost` when LPG is the stove assessed in order to ensure that the
         transportation costs are included
 
@@ -1004,6 +1006,8 @@ class LPG(Technology):
         relative: bool, default True
             Boolean parameter to indicate if the discounted investments will be calculated relative to the `base_fuel`
             or not.
+        improved_supply_chain: bool, default False
+            Boolean parameter to indicate if the fuel cost for LPG should be calculated with the improved supply chain cost (i.e. user cost) or not. 
 
         See also
         --------
