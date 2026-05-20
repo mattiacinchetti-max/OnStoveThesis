@@ -1,0 +1,21 @@
+name: onstovesnake
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - dill
+  - geopandas
+  - jupyterlab
+  - matplotlib
+  - plotnine>=0.12.2
+  - psycopg2
+  - psutil
+  - pyproj
+  - python>=3.10
+  - python-decouple
+  - rasterio
+  - scikit-image
+  - snakemake-minimal
+  - svgpathtools
+  - svgpath2mpl

@@ -1,0 +1,23 @@
+name: onstove-tests
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - boto3
+  - dill
+  # - flake8
+  - geopandas
+  - matplotlib
+  - plotnine>=0.12.2
+  - psutil
+  - psycopg2
+  - pyproj
+  - python=>3.10
+  - python-decouple
+  - pytest
+  - pytest-cov
+  - pytest-order
+  - rasterio
+  - scikit-image
+  - svgpathtools
+  - svgpath2mpl
