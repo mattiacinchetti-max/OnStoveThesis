@@ -1017,7 +1017,7 @@ class LPG(Technology):
         if not improved_supply_chain:
             self.transportation_cost(model)
 
-        super().discount_fuel_cost(model, relative)
+        super().discount_fuel_cost(model, relative, improved_supply_chain=improved_supply_chain)
 
     def transport_emissions(self, model: 'onstove.OnStove'):
         """Calculates the emissions caused by the transportation of LPG. This is dependent on the diesel consumption of

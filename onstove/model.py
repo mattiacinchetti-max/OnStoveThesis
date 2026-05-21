@@ -2105,7 +2105,7 @@ class OnStove(DataProcessor):
 
     def run(self, technologies: Optional[Union[list, dict, str]] = 'all', restriction: bool = True, prioritize: bool = True,
             affordability_categories: list = ['<5%', '5-15%', '15%+'], target: str = 'net_benefit', partial_access: bool = False,
-            tech_groups: Optional[dict[str, list[str]]] = None):
+            tech_groups: Optional[dict[str, list[str]]] = None, improved_supply_chain: bool = False):
         """Runs the model using the defined ``technologies`` as options to cook with.
 
         It loops through the ``technologies`` and calculates all costs, benefit and the net-benefit of cooking with
@@ -2145,6 +2145,9 @@ class OnStove(DataProcessor):
             Optional dictionary mapping group names to lists of technology names. If a share key is a group,
             the share is treated as a single competitive pool among the group's technologies, assigned by
             the selected target metric (idxmax/idxmin) without equal pre-splitting.
+
+        improved_supply_chain: bool, default False  
+            Whether to apply the improved LPG cost logic or not
 
         See also
         --------
@@ -2210,7 +2213,7 @@ class OnStove(DataProcessor):
             tech.required_energy(self)
             tech.discounted_om(self)
             tech.discounted_inv(self)
-            tech.discount_fuel_cost(self)
+            tech.discount_fuel_cost(self, improved_supply_chain=improved_supply_chain)
             tech.salvage(self)
             print(f'Calculating net benefit for {tech.name}...\n')
             tech.net_benefit(self, self.specs['w_health'], self.specs['w_spillovers'],
