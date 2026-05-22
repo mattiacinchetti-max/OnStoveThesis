@@ -41,6 +41,7 @@ from scipy.spatial import cKDTree
 import function_costs as cost
 import function_allocation as alloc
 import function_process as process
+from dataclasses import dataclass  
 
 def _as_vector_layer(gdf, name="mask"):
     """

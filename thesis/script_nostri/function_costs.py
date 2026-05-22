@@ -41,6 +41,7 @@ from scipy.spatial import cKDTree
 import function_tools as tool
 import function_allocation as alloc
 import function_process as process
+from dataclasses import dataclass
 
 def ports(gdf, import_cost_df):
     """
@@ -85,7 +86,7 @@ def ports(gdf, import_cost_df):
 
     return gdf
 
-def border_points(gdf, import_cost_df):
+def border_points(gdf, import_cost_df, vehicle: Vehicle):
     """
     Calculates Land Import costs, Border Time costs, and Ferry costs.
     Updates final LPG_price and stores individual components as attributes.
@@ -102,7 +103,7 @@ def border_points(gdf, import_cost_df):
     bp['cost_import_land'] = bp['LPG_price'] * import_land_rate
 
     # Logistics constants for cost calculation
-    effective_load_kg = tanker_capacity_kg * utilization_factor
+    effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
     driver_hourly_cost_usd = (driver_annual_salary_usd * salary_multiplier) / (hours_per_day * days_per_year)
 
     # 2. Border Waiting Time Cost
@@ -144,59 +145,58 @@ def crf(rate: float, years: int) -> float:
 
 # Calculate fixed cost inputs used by the cost per kg functions.
 # This makes the downstream functions depend only on distance/time.
-effective_load_kg = tanker_capacity_kg * utilization_factor
+
 
 driver_hourly_cost_usd = (
     driver_annual_salary_usd * salary_multiplier / (hours_per_day * days_per_year)
 )
 
-crf_tanker = crf(discount_rate, tanker_life_years)
-crf_license = crf(discount_rate, licence_life_years)
-annual_capital_cost_usd = tanker_overnight_cost_usd * crf_tanker
-annual_license_cost_usd = license_cost_usd * crf_license
-fixed_annual_tanker_cost_usd = annual_capital_cost_usd + annual_license_cost_usd
-
-def tanker_fixed(avg_one_way_dist_km: float) -> float:
+def single_travel_fixed(avg_one_way_dist_km: float, vehicle: Vehicle) -> float:
     """
     Compute fixed transport cost per kg for an average route.
     Uses annualized capital and license costs.
     Scales by expected trips and effective load.
     """
     avg_round_trip_km = 2.0 * avg_one_way_dist_km
-    trips_per_year = tanker_annual_km / avg_round_trip_km
-    fixed_tanker_cost_per_kg = fixed_annual_tanker_cost_usd / (effective_load_kg * trips_per_year)
-    return fixed_tanker_cost_per_kg
+    trips_per_year = vehicle.annual_km / avg_round_trip_km
+    effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
+    crf_vehicle = crf(discount_rate, vehicle.life_years)
+    crf_license = crf(discount_rate, licence_life_years)
+    annual_capital_cost_usd = vehicle.overnight_cost_usd * crf_vehicle
+    annual_license_cost_usd = license_cost_usd * crf_license
+    fixed_annual_cost_usd = annual_capital_cost_usd + annual_license_cost_usd
+    fixed_cost_per_kg = fixed_annual_cost_usd / (effective_load_kg * trips_per_year)
+    return fixed_cost_per_kg
 
-def tanker_variable(
-    one_way_distance_km: float,
-    one_way_time_min: float
-) -> float:
+def single_travel_variable(one_way_distance_km: float, one_way_time_min: float, vehicle: Vehicle) -> float:
     """
     Compute variable transport cost per kg for a single route.
     Includes distance-based operating costs and labor time.
     Uses the effective load to normalize per kg.
     """
-    round_trip_hours = (one_way_time_min * 2.0 / 60.0) + fixed_loading_unloading_hours
+    round_trip_hours = (one_way_time_min * 2.0 / 60.0) + vehicle.fixed_loading_unloading_hours
     round_trip_distance_km = 2.0 * one_way_distance_km
     variable_cost_trip = (
-        variable_cost_per_km * round_trip_distance_km 
+        vehicle.variable_cost_per_km * round_trip_distance_km 
         + driver_hourly_cost_usd * round_trip_hours
-)
+    )
+    effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
     variable_cost_per_kg = variable_cost_trip / effective_load_kg
     return variable_cost_per_kg
 
-def tanker(
+def single_travel(
     one_way_distance_km: float,
     one_way_time_min: float,
-    avg_one_way_dist_km: float
+    avg_one_way_dist_km: float,
+    vehicle: Vehicle
 ) -> dict:
     """
     Compute fixed, variable, and total transport costs per kg.
     Fixed cost uses average route distance; variable uses per-route inputs.
     Returns a dict with component and total values.
     """
-    fixed_cost = tanker_fixed(avg_one_way_dist_km)
-    variable_cost = tanker_variable(one_way_distance_km, one_way_time_min)
+    fixed_cost = single_travel_fixed(avg_one_way_dist_km, vehicle)
+    variable_cost = single_travel_variable(one_way_distance_km, one_way_time_min, vehicle)
     total_cost = fixed_cost + variable_cost
     
     return {
@@ -281,3 +281,164 @@ def storage(
 
     return ps
 
+def calculate_average_transport_distance(points_dict):
+    """
+    Calculate weighted average one-way transport distance from all facilities to storage.
+    Weight is based on allocation percentages (percentage column).
+    
+    Formula: avg_dist = Σ(distance_i × percentage_i) / Σ(percentage_i)
+    
+    This ensures facilities with higher allocation percentages influence the 
+    average distance more, reflecting actual logistics flows.
+    """
+    facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
+    
+    weighted_distances = []
+    total_weight = 0
+    
+    for key in facility_keys:
+        gdf = points_dict.get(key)
+        if gdf is None or gdf.empty:
+            continue
+        if 'tank_distance' not in gdf.columns or 'percentage' not in gdf.columns:
+            continue
+        
+        # Extract distances and percentages
+        dist = pd.to_numeric(gdf['tank_distance'], errors='coerce').to_numpy(dtype=float)
+        pct = pd.to_numeric(gdf['percentage'], errors='coerce').to_numpy(dtype=float)
+        
+        # Valid rows: both distance and percentage are finite and positive
+        valid = np.isfinite(dist) & (dist > 0) & np.isfinite(pct) & (pct > 0)
+        
+        if valid.any():
+            valid_dist = dist[valid]
+            valid_pct = pct[valid]
+            
+            # Weighted sum for this facility type
+            weighted_distances.append(np.sum(valid_dist * valid_pct))
+            total_weight += np.sum(valid_pct)
+    
+    if total_weight == 0:
+        raise ValueError("No valid weighted distances found (all allocation percentages are zero)")
+    
+    avg_distance = float(np.sum(weighted_distances) / total_weight)
+    
+    print(f"✓ Average transport distance (allocation-weighted): {avg_distance:.2f} km")
+    
+    return avg_distance
+
+
+def transport_to_storage(points_dict, vehicle: Vehicle):
+    """
+    Calculate transport cost from each facility to its assigned storage.
+    
+    This function computes the cost_transport_to_storage for all facility types
+    (refineries, ports, gas_plants, border_points) based on their distance and 
+    travel time to assigned storage facilities.
+    """
+    facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
+    
+    # calculate avg_one_way_dist_km 
+    avg_one_way_dist_km = calculate_average_transport_distance(points_dict)
+
+    # Validate avg_one_way_dist_km
+    if not np.isfinite(avg_one_way_dist_km) or avg_one_way_dist_km <= 0:
+        print(f"⚠ Warning: Invalid avg_one_way_dist_km = {avg_one_way_dist_km}. All costs set to NaN")
+        for key in facility_keys:
+            gdf = points_dict.get(key)
+            if gdf is not None:
+                gdf['cost_transport_to_storage'] = np.nan
+                points_dict[key] = gdf
+        return points_dict
+    
+    # Calculate transport cost for each facility
+    for key in facility_keys:
+        gdf = points_dict.get(key)
+        if gdf is None:
+            continue
+        
+        # Check for required columns
+        if 'tank_distance' not in gdf.columns or 'tank_traveltime' not in gdf.columns:
+            gdf['cost_transport_to_storage'] = np.nan
+            points_dict[key] = gdf
+            continue
+        
+        # Extract distance and time arrays
+        d_km = pd.to_numeric(gdf['tank_distance'], errors='coerce').to_numpy(dtype=float)
+        t_min = pd.to_numeric(gdf['tank_traveltime'], errors='coerce').to_numpy(dtype=float)
+        out_cost = np.full(len(gdf), np.nan, dtype=float)
+        
+        # Identify valid rows (all values are finite and positive)
+        valid = np.isfinite(d_km) & (d_km > 0) & np.isfinite(t_min) & (t_min >= 0)
+        valid_idx = np.where(valid)[0]
+        
+        # Compute tanker cost for each valid row
+        for i in valid_idx:
+            out_cost[i] = single_travel(
+                one_way_distance_km=float(d_km[i]),
+                one_way_time_min=float(t_min[i]),
+                avg_one_way_dist_km=avg_one_way_dist_km,
+                vehicle=vehicle
+            )['total_cost_per_kg']
+        
+        gdf['cost_transport_to_storage'] = out_cost
+        points_dict[key] = gdf
+    
+    return points_dict
+
+
+def aggregate_transport_costs_to_storage(points_dict):
+    """
+    Aggregate facility-level transport costs to primary storage using weighted average.
+    
+    This function collects cost_transport_to_storage from all facility types,
+    applies a weighted average by facility percentage, and merges results back
+    to the primary_storage GeoDataFrame.
+   
+    """
+    facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
+    
+    # Initialize primary storage
+    primary_storage = points_dict["primary_storage"].copy()
+    if 'name' not in primary_storage.columns:
+        primary_storage['name'] = [f'primary_storage_{i}' for i in range(len(primary_storage))]
+    
+    # Gather facility data
+    weighted_df = pd.concat([
+        points_dict[k][['tank_name', 'cost_transport_to_storage', 'percentage']]
+        for k in facility_keys if points_dict.get(k) is not None
+    ], ignore_index=True)
+    
+    # Conversions and filtering
+    weighted_df = weighted_df.assign(
+        cost_transport_to_storage=lambda x: pd.to_numeric(x['cost_transport_to_storage'], errors='coerce'),
+        percentage=lambda x: pd.to_numeric(x['percentage'], errors='coerce').fillna(0)
+    ).dropna(subset=['cost_transport_to_storage'])
+    weighted_df = weighted_df[weighted_df['percentage'] > 0]
+    
+    # Calculate weighted average
+    if len(weighted_df) > 0:
+        weighted_df = weighted_df.assign(
+            weighted=lambda x: x['cost_transport_to_storage'] * x['percentage']
+        )
+        
+        agg = weighted_df.groupby('tank_name', as_index=False).agg(
+            weighted_cost_sum=('weighted', 'sum'),
+            weight_sum=('percentage', 'sum')
+        )
+        
+        agg['cost_transport_to_storage'] = agg['weighted_cost_sum'] / agg['weight_sum']
+        
+        # Merge back to primary storage
+        primary_storage = primary_storage.merge(
+            agg[['tank_name', 'cost_transport_to_storage']], 
+            left_on='name', 
+            right_on='tank_name', 
+            how='left'
+        ).drop('tank_name', errors='ignore')
+    else:
+        primary_storage['cost_transport_to_storage'] = np.nan
+    
+    # Update points dict
+    points_dict['primary_storage'] = primary_storage
+    return points_dict

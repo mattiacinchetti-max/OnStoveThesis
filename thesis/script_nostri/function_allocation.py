@@ -41,6 +41,7 @@ from scipy.spatial import cKDTree
 import function_tools as tool
 import function_costs as cost
 import function_process as process
+from dataclasses import dataclass
 
 def build_cost_surface(friction_path):
     """
@@ -232,7 +233,7 @@ def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_p
     
     return facilities
 
-def calculate_percentages(refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df):
+def calculate_percentages_supply(refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df):
     """
     Calculate facility-level market shares from national shares and capacities.
     Uses capacity-based weights for refineries, ports, and gas plants.
@@ -350,3 +351,265 @@ def calculate_percentages(refineries_gdf, ports_gdf, gas_plants_gdf, border_poin
     print(f"✓ {len(result)} sources calculated | Total share: {result['percentage'].sum():.2%}")
     return result, by_category
 
+def calculate_percentages_filling(filling_gdf):
+    """
+    Calculate demand-based percentage shares for filling points.
+    Searches for demand columns in priority order: percentage_demand, total_fil_clients, clients.
+    If found column represents counts, converts to percentage share of total demand.
+    Adds 'percentage_demand' column to the GeoDataFrame.
+    """
+    filling = filling_gdf.copy()
+    
+    # Determine the column to use for demand (priority: percentage, then client counts)
+    demand_col = next((c for c in ["percentage_demand", "total_fil_clients", "clients"] if c in filling.columns), None)
+
+    if demand_col:
+        demand_vals = pd.to_numeric(filling[demand_col], errors="coerce").fillna(0.0)
+        
+        # If the column represents raw counts (clients), convert to a percentage share of total demand
+        if demand_col != "percentage_demand":
+            total_demand = demand_vals.sum()
+            filling["percentage_demand"] = (demand_vals / total_demand) if total_demand > 0 else 0.0
+        else:
+            filling["percentage_demand"] = demand_vals
+            
+        print(f"✓ Demand shares calculated using column: {demand_col}")
+        return filling
+    else:
+        raise ValueError("No demand-related column found in filling_gdf (expected: percentage_demand, total_fil_clients, or clients)")
+
+
+def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf):
+    """
+    Aggregate supply percentages from all sources (refineries, ports, gas plants, border points)
+    to primary storage facilities at the storage level.
+    """
+    ps = primary_storage_gdf.copy()
+    ps["id_supply"] = ps["id_supply"].astype(str)
+    
+    # Collect all supply layers
+    supply_layers = [refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf]
+    supply_layers = [g for g in supply_layers if g is not None and not g.empty]
+    
+    if supply_layers:
+        # Align CRS across all layers
+        target_crs = next((g.crs for g in supply_layers if g.crs is not None), None)
+        if target_crs is not None:
+            aligned_layers = [g.to_crs(target_crs) if g.crs is not None and g.crs != target_crs else g for g in supply_layers]
+        else:
+            aligned_layers = supply_layers
+        
+        all_supply = pd.concat(aligned_layers, ignore_index=True)
+    else:
+        all_supply = gpd.GeoDataFrame()
+    
+    # Aggregate supply by tank_id_supply
+    if not all_supply.empty and "tank_id_supply" in all_supply.columns:
+        supply_sum = all_supply.groupby("tank_id_supply")["percentage"].sum()
+    else:
+        supply_sum = pd.Series(dtype="float64")
+    
+    ps["percentage_supply"] = ps["id_supply"].map(supply_sum).fillna(0.0)
+    
+    print(f"✓ Supply aggregated to {len(ps)} storage facilities | Total supply: {ps['percentage_supply'].sum():.4f}")
+    return ps
+
+
+def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):
+    """
+    Aggregate filling percentages from all filling points to primary storage facilities
+    at the storage level.
+    """
+    ps = primary_storage_gdf.copy()
+    ps["id_supply"] = ps["id_supply"].astype(str)
+    
+    # Aggregate filling percentages by tank_id_supply
+    if filling_points_gdf is not None and not filling_points_gdf.empty and "tank_id_supply" in filling_points_gdf.columns:
+        filling_sum = filling_points_gdf.groupby("tank_id_supply")["percentage_demand"].sum()
+    else:
+        filling_sum = pd.Series(dtype="float64")
+    
+    ps["percentage_demand"] = ps["id_supply"].map(filling_sum).fillna(0.0)
+    
+    print(f"✓ Filling aggregated to {len(ps)} storage facilities | Total filling: {ps['percentage_demand'].sum():.4f}")
+    return ps
+
+
+def build_storage_routing_matrices(primary_storage_gdf, friction_path):
+    """
+    Build travel time and distance matrices for inter-storage routing.
+    Computes N×N matrices where N = number of storage facilities.
+    """
+    ps = primary_storage_gdf.copy()
+    n_storage = len(ps)
+    storage_ids = ps.index.tolist()
+    
+    # Build cost surface
+    cost_layer, transform, geod, crs_obj = build_cost_surface(friction_path)
+    
+    if crs_obj is None:
+        raise ValueError("Friction raster has no CRS in metadata")
+    
+    # Project storage to friction CRS
+    storage_tt = ps.to_crs(crs_obj).copy()
+    storage_points = storage_tt.geometry
+    if not storage_tt.geom_type.eq('Point').all():
+        storage_points = storage_tt.geometry.centroid
+    
+    # Precompute pixel coordinates
+    storage_rows, storage_cols = [], []
+    for geom in storage_points:
+        r, c = rasterio.transform.rowcol(transform, geom.x, geom.y)
+        storage_rows.append(r)
+        storage_cols.append(c)
+    
+    # Compute N×N routing matrices
+    travel_time_matrix = np.full((n_storage, n_storage), np.inf, dtype=np.float64)
+    distance_matrix = np.full((n_storage, n_storage), np.nan, dtype=np.float64)
+    
+    for i, (orig_row, orig_col) in enumerate(zip(storage_rows, storage_cols)):
+        t_times, t_dists = calculate_mcp_routes(
+            orig_row, orig_col, storage_rows, storage_cols, cost_layer, transform, geod
+        )
+        travel_time_matrix[i, :] = t_times * 60.0  # Convert hours to minutes
+        distance_matrix[i, :] = t_dists
+    
+    print(f"✓ Routing matrices computed for {n_storage} storage facilities\n")
+    return travel_time_matrix, distance_matrix, crs_obj, storage_ids
+
+
+def optimize_storage_allocation(primary_storage_gdf, travel_time_matrix):
+    """
+    Solve Linear Programming problem to optimize inter-storage allocation.
+    Minimizes total travel time subject to supply/demand balance constraints.
+    """
+    ps = primary_storage_gdf.copy()
+    n_storage = len(ps)
+    
+    # Flatten cost vector (travel times)
+    c = travel_time_matrix.flatten()
+    
+    # Build constraint matrices
+    A_eq = []
+    b_eq = []
+    
+    # Supply constraints: sum(x[i,:]) = supply[i]
+    for i in range(n_storage):
+        row = np.zeros(n_storage * n_storage)
+        row[i * n_storage:(i+1) * n_storage] = 1
+        A_eq.append(row)
+        b_eq.append(float(ps.iloc[i]['percentage_supply']))
+    
+    # Demand constraints: sum(x[:,j]) = demand[j]
+    for j in range(n_storage):
+        row = np.zeros(n_storage * n_storage)
+        for i in range(n_storage):
+            row[i * n_storage + j] = 1
+        A_eq.append(row)
+        b_eq.append(float(ps.iloc[j]['percentage_demand']))
+    
+    A_eq = np.array(A_eq)
+    b_eq = np.array(b_eq)
+    
+    # Solve LP
+    result = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=(0, None), method='highs')
+    
+    if result.success:
+        allocation_matrix = result.x.reshape((n_storage, n_storage))
+        print(f"✓ Optimization successful\n")
+        print(f"  Objective (total travel time): {result.fun:.4f} minutes\n")
+    else:
+        print(f"✗ Optimization failed: {result.message}\n")
+        allocation_matrix = np.zeros((n_storage, n_storage))
+    
+    return allocation_matrix, result
+
+
+def write_allocation_excel(primary_storage_gdf, travel_time_matrix, distance_matrix, allocation_matrix, output_path):
+    """
+    Write storage allocation results to Excel workbook with three sheets.
+    """
+    ps = primary_storage_gdf.copy()
+    storage_ids = ps.index.tolist()
+    storage_labels = [f"{i}" for i in storage_ids]
+    n_storage = len(ps)
+    
+    wb = Workbook()
+    wb.remove(wb.active)
+    
+    # Sheet 1: Travel Time (minutes)
+    ws1 = wb.create_sheet("storage_allocation_time")
+    ws1.append(["Storage ID"] + storage_labels)
+    for i, label_i in enumerate(storage_labels):
+        row_data = [label_i] + travel_time_matrix[i, :].tolist()
+        ws1.append(row_data)
+    
+    # Sheet 2: Distance (km)
+    ws2 = wb.create_sheet("storage_allocation_distance")
+    ws2.append(["Storage ID"] + storage_labels)
+    for i, label_i in enumerate(storage_labels):
+        row_data = [label_i] + distance_matrix[i, :].tolist()
+        ws2.append(row_data)
+    
+    # Sheet 3: Allocation (percentages)
+    ws3 = wb.create_sheet("storage_allocation_percentage")
+    ws3.append(["Storage ID"] + storage_labels)
+    for i, label_i in enumerate(storage_labels):
+        row_data = [label_i] + allocation_matrix[i, :].tolist()
+        ws3.append(row_data)
+    
+    wb.save(output_path)
+    print(f"✓ Saved: {output_path}")
+    
+    return Path(output_path)
+
+
+def allocation_process(primary_storage_gdf, friction_path, output_excel_path):
+    """
+    Orchestrate complete storage allocation optimization workflow.
+    Builds routing matrices, solves LP, validates results, and exports to Excel.
+    """
+    ps = primary_storage_gdf.copy()
+    n_storage = len(ps)
+    
+    print(f"Primary storage facilities: {n_storage}")
+    print(f"Supply: {ps['percentage_supply'].sum():.4f}")
+    print(f"Demand: {ps['percentage_demand'].sum():.4f}\n")
+    print()
+    
+    # Step 1: Build routing matrices
+    travel_time_matrix, distance_matrix, crs_obj, storage_ids = build_storage_routing_matrices(ps, friction_path)
+    print()
+    
+    # Step 2: Optimize allocation
+    allocation_matrix, opt_result = optimize_storage_allocation(ps, travel_time_matrix)
+    print()
+    
+    # Step 3: Validate
+    total_allocated = allocation_matrix.sum()
+    total_supply = ps['percentage_supply'].sum()
+    total_demand = ps['percentage_demand'].sum()
+    
+    print(f"Validation:")
+    print(f"  Total allocation: {total_allocated:.6f}")
+    print(f"  Total supply: {total_supply:.6f}")
+    print(f"  Total demand: {total_demand:.6f}\n")
+    
+    if abs(total_allocated - total_supply) > 1e-6 or abs(total_allocated - total_demand) > 1e-6:
+        print(f"  ⚠ Warning: allocation does not balance!\n")
+    else:
+        print(f"  ✓ Allocation balanced\n")
+    print()
+    
+    # Step 4: Export
+    write_allocation_excel(ps, travel_time_matrix, distance_matrix, allocation_matrix, output_excel_path)
+    
+    return {
+        'allocation_matrix': allocation_matrix,
+        'travel_time_matrix': travel_time_matrix,
+        'distance_matrix': distance_matrix,
+        'optimization_result': opt_result,
+        'n_storage': n_storage,
+        'total_supply': total_supply,
+        'total_demand': total_demand,
+    }

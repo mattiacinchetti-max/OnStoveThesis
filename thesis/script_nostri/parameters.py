@@ -19,16 +19,46 @@ salary_multiplier = 1.18
 hours_per_day = 8 # working hours per day
 days_per_year = 330 # working days per year
 
-# Tankers parameters
-tanker_capacity_kg = 24000
-utilization_factor = 0.85
-variable_cost_per_km = 0.635
-tanker_overnight_cost_usd = 197673 
-tanker_life_years = 35
-license_cost_usd = 418
-licence_life_years = 5
-fixed_loading_unloading_hours = 1.0
-tanker_annual_km = 42000 
+from dataclasses import dataclass
+
+@dataclass
+class Vehicle:
+    name: str
+    capacity_kg: float
+    utilization_factor: float
+    overnight_cost_usd: float
+    life_years: int
+    variable_cost_per_km: float
+    annual_km: int
+    fixed_loading_unloading_hours: float
+
+tanker = Vehicle(
+    name="tanker",
+    capacity_kg=24000,
+    utilization_factor=0.85,
+    overnight_cost_usd=197673,
+    life_years=35,
+    variable_cost_per_km=0.635,
+    annual_km=42000,
+    fixed_loading_unloading_hours=1.0,
+)
+
+truck = Vehicle(
+    name="truck",
+    capacity_kg=9996,
+    utilization_factor=0.85,
+    overnight_cost_usd=170200,
+    life_years=15,
+    variable_cost_per_km=0.54,
+    annual_km=42000,
+    fixed_loading_unloading_hours=1.0,
+)
+
+# TODO car element in vehicle class?
+
+# license paramters
+license_cost_usd=418
+licence_life_years=5
 
 # Stove parameters (OnStove defaults) (used for storage cost calculation and capacity estimation)
 meals_per_day = 1.0

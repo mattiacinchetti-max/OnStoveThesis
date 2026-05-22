@@ -41,6 +41,7 @@ from scipy.spatial import cKDTree
 import function_tools as tool
 import function_costs as cost
 import function_allocation as alloc
+from dataclasses import dataclass
 
 def fill_from_buffer(gdf, default_gdf, cols, buffer_km=BUFFER_KM):
     """
