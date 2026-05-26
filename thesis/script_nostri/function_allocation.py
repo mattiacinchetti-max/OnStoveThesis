@@ -43,9 +43,9 @@ import function_costs as cost
 import function_process as process
 from dataclasses import dataclass
 
-def build_cost_surface(friction_path):
+def build_surface(friction_path):
     """
-    Build a cost surface from friction data and expose CRS utilities.
+    Build a surface from friction data and expose CRS utilities.
     Converts friction values to hours/km and sets nodata to inf.
     Returns the cost array, transform, geodesic helper, and CRS.
     Use the returned CRS for routing projections.
@@ -113,7 +113,7 @@ def calculate_mcp_routes(origin_row, origin_col, dest_rows, dest_cols, cost_laye
     return times_hours, distances_km
 
 
-def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_path=None, cost_surface_data=None):
+def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_path=None, surface_data=None):   # TODO remove if replaced by assign_nearest
     """
     Assign nearest storage by least-time path and compute route distance.
     Adds storage id/name, travel time (minutes), and route distance (km).
@@ -137,13 +137,13 @@ def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_p
         return facilities
 
     # Build cost surface and get projection info once
-    if cost_surface_data is not None:
-        cost_layer, transform, geod, friction_crs = cost_surface_data
+    if surface_data is not None:
+        cost_layer, transform, geod, friction_crs = surface_data
     else:
         friction_file = Path(friction_path)
         if not friction_file.exists():
             raise FileNotFoundError(f"Missing friction raster: {friction_file}")
-        cost_layer, transform, geod, friction_crs = build_cost_surface(friction_file)
+        cost_layer, transform, geod, friction_crs = build_surface(friction_file)
 
     if friction_crs is None:
         raise ValueError("Friction raster has no CRS in metadata")
@@ -232,6 +232,122 @@ def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_p
     facilities['tank_traveltime'] = tank_traveltime
     
     return facilities
+
+def assign_nearest(
+    layer1: gpd.GeoDataFrame,
+    layer2: gpd.GeoDataFrame,
+    layer1_name: str,
+    layer1_id_col: str,
+    surface_data: tuple = None,
+    friction_path: str = None
+) -> gpd.GeoDataFrame:
+    """
+    For each feature in layer2, find the nearest feature in layer1 by least‑time path.
+    
+    Adds three columns to layer2:
+        nearest_{layer1_name}_id       – ID of the nearest feature in layer1
+        nearest_{layer1_name}_distance – One‑way path distance (km)
+        nearest_{layer1_name}_time     – One‑way travel time (minutes)
+    
+    Parameters
+    ----------
+    layer1 : gpd.GeoDataFrame
+        Origin points (must have point geometries and an ID column).
+    layer2 : gpd.GeoDataFrame
+        Destination points (point geometries).
+    layer1_name : str
+        Name of the origin layer, used as suffix for output columns (e.g., 'primary_storage').
+    surface_data : tuple, optional
+        Precomputed cost surface (cost_layer, transform, geod, crs_obj).
+    friction_path : str, optional
+        Path to friction raster; required if surface_data is None.
+    layer1_id_col : str, default 'id_supply'
+        Column in layer1 that uniquely identifies each feature.
+    
+    Returns
+    -------
+    gpd.GeoDataFrame
+        A copy of layer2 with the three additional columns.
+    """
+    result = layer2.copy()
+    
+    if result.empty:
+        for suffix in ['_id', '_distance', '_time']:
+            result[f"nearest_{layer1_name}_{suffix}"] = None
+        return result
+    
+    if layer1.empty:
+        raise ValueError("Layer1 (origin) GeoDataFrame is empty; cannot assign.")
+    
+    # Build or retrieve cost surface
+    if surface_data is None:
+        if friction_path is None:
+            raise ValueError("Either surface_data or friction_path must be provided")
+        surface_data = build_cost_surface(friction_path)   # ensure function exists
+    cost_layer, transform, geod, crs_obj = surface_data
+    
+    # Reproject both layers to the raster CRS
+    layer1_proj = layer1.to_crs(crs_obj)
+    layer2_proj = result.to_crs(crs_obj)
+    
+    # Get pixel coordinates
+    def get_pixel_coords(gdf):
+        rows, cols = [], []
+        for geom in gdf.geometry:
+            if geom.is_empty:
+                rows.append(-1)
+                cols.append(-1)
+            else:
+                r, c = rowcol(transform, geom.x, geom.y)
+                rows.append(r)
+                cols.append(c)
+        return np.array(rows), np.array(cols)
+    
+    o_rows, o_cols = get_pixel_coords(layer1_proj)
+    d_rows, d_cols = get_pixel_coords(layer2_proj)
+    
+    n_origins = len(layer1)
+    n_dests = len(result)
+    
+    best_origin_idx = np.full(n_dests, -1, dtype=int)
+    best_times = np.full(n_dests, np.inf, dtype=float)
+    best_dists = np.full(n_dests, np.nan, dtype=float)
+    
+    # For each origin, compute routes to all destinations and update best
+    for i in range(n_origins):
+        if o_rows[i] < 0 or o_cols[i] < 0:
+            continue
+        times_h, dists = calculate_mcp_routes(
+            o_rows[i], o_cols[i],
+            d_rows, d_cols,
+            cost_layer, transform, geod
+        )
+        # times_h in hours, dists in km
+        for j in range(n_dests):
+            t = times_h[j] * 60.0  # convert to minutes
+            if np.isfinite(t) and t < best_times[j]:
+                best_times[j] = t
+                best_dists[j] = dists[j]
+                best_origin_idx[j] = i
+    
+    # Prepare output columns
+    id_col = f"nearest_{layer1_name}_id"
+    dist_col = f"nearest_{layer1_name}_distance"
+    time_col = f"nearest_{layer1_name}_time"
+    
+    result[id_col] = None
+    result[dist_col] = np.nan
+    result[time_col] = np.nan
+    
+    origin_ids = layer1[layer1_id_col].astype(str).to_numpy()
+    
+    for j in range(n_dests):
+        if best_origin_idx[j] >= 0:
+            result.at[result.index[j], id_col] = origin_ids[best_origin_idx[j]]
+            result.at[result.index[j], dist_col] = best_dists[j]
+            result.at[result.index[j], time_col] = best_times[j]
+    
+    return result
 
 def calculate_percentages_supply(refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df):
     """
@@ -379,7 +495,7 @@ def calculate_percentages_filling(filling_gdf):
         raise ValueError("No demand-related column found in filling_gdf (expected: percentage_demand, total_fil_clients, or clients)")
 
 
-def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf):
+def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf): # TODO remove if replaced by aggregate_to_storage
     """
     Aggregate supply percentages from all sources (refineries, ports, gas plants, border points)
     to primary storage facilities at the storage level.
@@ -403,9 +519,9 @@ def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, 
     else:
         all_supply = gpd.GeoDataFrame()
     
-    # Aggregate supply by tank_id_supply
-    if not all_supply.empty and "tank_id_supply" in all_supply.columns:
-        supply_sum = all_supply.groupby("tank_id_supply")["percentage"].sum()
+    # Aggregate supply by tank id (nearest_primary_storage_id)
+    if not all_supply.empty and "nearest_primary_storage_id" in all_supply.columns:
+        supply_sum = all_supply.groupby("nearest_primary_storage_id")["percentage"].sum()
     else:
         supply_sum = pd.Series(dtype="float64")
     
@@ -415,7 +531,7 @@ def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, 
     return ps
 
 
-def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):
+def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):  # TODO remove if replaced by aggregate_to_storage
     """
     Aggregate filling percentages from all filling points to primary storage facilities
     at the storage level.
@@ -423,9 +539,9 @@ def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):
     ps = primary_storage_gdf.copy()
     ps["id_supply"] = ps["id_supply"].astype(str)
     
-    # Aggregate filling percentages by tank_id_supply
-    if filling_points_gdf is not None and not filling_points_gdf.empty and "tank_id_supply" in filling_points_gdf.columns:
-        filling_sum = filling_points_gdf.groupby("tank_id_supply")["percentage_demand"].sum()
+    # Aggregate filling percentages by nearest_primary_storage_id
+    if filling_points_gdf is not None and not filling_points_gdf.empty and "nearest_primary_storage_id" in filling_points_gdf.columns:
+        filling_sum = filling_points_gdf.groupby("nearest_primary_storage_id")["percentage_demand"].sum()
     else:
         filling_sum = pd.Series(dtype="float64")
     
@@ -445,7 +561,7 @@ def build_storage_routing_matrices(primary_storage_gdf, friction_path):
     storage_ids = ps.index.tolist()
     
     # Build cost surface
-    cost_layer, transform, geod, crs_obj = build_cost_surface(friction_path)
+    cost_layer, transform, geod, crs_obj = build_surface(friction_path)
     
     if crs_obj is None:
         raise ValueError("Friction raster has no CRS in metadata")
@@ -613,3 +729,4 @@ def allocation_process(primary_storage_gdf, friction_path, output_excel_path):
         'total_supply': total_supply,
         'total_demand': total_demand,
     }
+

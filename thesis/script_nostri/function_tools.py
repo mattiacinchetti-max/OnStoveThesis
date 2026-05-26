@@ -251,10 +251,8 @@ def _as_bool_series(series):
     return series.apply(_to_bool)
 
 def export_gpkg(points, data_dir, stage=""):
-    output_path = f"{data_dir}/first_step.gpkg"
-        
-    order = ["refineries", "ports", "gas_plants", "primary_storage", "border_points", "filling_points", "primary_storage_allocated"]
-    
+    output_path = f"{data_dir}/supply_chain_layer.gpkg"
+    order = ['refineries', 'ports', 'gas_plants', 'border_points', 'primary_storage', 'primary_storage_allocated', 'filling_points', 'resell']
     written = 0
     for name in order:
         gdf = points.get(name)
@@ -264,3 +262,25 @@ def export_gpkg(points, data_dir, stage=""):
         current_mode = "w"
         gdf.to_file(output_path, layer=name, driver="GPKG", mode=current_mode)
         written += 1
+
+def combine_supply_layers(points: dict) -> gpd.GeoDataFrame:
+    """
+    Combines the supply layers (refineries, ports, gas_plants, border_points)
+    in a single GeoDataFrame with necessary columns for transport cost calculation.
+    """
+    supply_keys = ['refineries', 'ports', 'gas_plants', 'border_points']
+    layers = []
+    for key in supply_keys:
+        gdf = points.get(key)
+        if gdf is not None and not gdf.empty:
+            gdf = gdf.copy()
+            gdf['supply_category'] = key   
+            layers.append(gdf)
+    if not layers:
+        return gpd.GeoDataFrame()
+    combined = pd.concat(layers, ignore_index=True)
+    # ensure presence of fundamental columns 
+    for col in ['percentage_supply', 'nearest_primary_storage_id', 'nearest_primary_storage_distance', 'nearest_primary_storage_time']:
+        if col not in combined.columns:
+            combined[col] = np.nan
+    return gpd.GeoDataFrame(combined, crs=layers[0].crs)

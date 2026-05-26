@@ -281,7 +281,7 @@ def storage(
 
     return ps
 
-def calculate_average_transport_distance(points_dict):
+def average_transport_distance(points_dict):
     """
     Calculate weighted average one-way transport distance from all facilities to storage.
     Weight is based on allocation percentages (percentage column).
@@ -328,7 +328,7 @@ def calculate_average_transport_distance(points_dict):
     return avg_distance
 
 
-def transport_to_storage(points_dict, vehicle: Vehicle):
+def transport_to_storage(points_dict, vehicle: Vehicle):  # TODO delete if replaced by trasport()
     """
     Calculate transport cost from each facility to its assigned storage.
     
@@ -339,7 +339,7 @@ def transport_to_storage(points_dict, vehicle: Vehicle):
     facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
     
     # calculate avg_one_way_dist_km 
-    avg_one_way_dist_km = calculate_average_transport_distance(points_dict)
+    avg_one_way_dist_km = average_transport_distance(points_dict)
 
     # Validate avg_one_way_dist_km
     if not np.isfinite(avg_one_way_dist_km) or avg_one_way_dist_km <= 0:
@@ -387,7 +387,7 @@ def transport_to_storage(points_dict, vehicle: Vehicle):
     return points_dict
 
 
-def aggregate_transport_costs_to_storage(points_dict):
+def aggregate_transport_costs_to_storage(points_dict):   # TODO replace if transport() is used
     """
     Aggregate facility-level transport costs to primary storage using weighted average.
     
@@ -442,3 +442,260 @@ def aggregate_transport_costs_to_storage(points_dict):
     # Update points dict
     points_dict['primary_storage'] = primary_storage
     return points_dict
+
+from typing import Union, Optional
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+
+def transport(
+    layer1: gpd.GeoDataFrame,
+    layer2: gpd.GeoDataFrame,
+    vehicle: Vehicle,
+    mode: str,  # 'convergence', 'cross_exchange', 'divergence'
+    layer1_name: Optional[str] = None,
+    layer2_name: Optional[str] = None,
+    weight: Optional[str] = None,
+    distance_matrix: Optional[np.ndarray] = None,
+    time_matrix: Optional[np.ndarray] = None,
+    weight_matrix: Optional[np.ndarray] = None,
+    id_col: str = 'id',
+    output_col: Optional[str] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Compute transport costs and optionally aggregate.
+
+    Modes:
+        convergence (ex nearest): layer1 has nearest_{layer2_name}_distance/time/id + weight.
+            Returns layer2 with weighted average cost per destination.
+        cross_exchange (ex all): uses distance_matrix, time_matrix, weight_matrix (n1 x n2).
+            Returns layer2 with weighted average cost per destination.
+        divergence (new): layer2 has nearest_{layer1_name}_distance/time.
+            Returns layer1 with individual cost per origin.
+    """
+    # Helper to compute individual costs for valid rows using nearest_{name}_* columns
+    def _cost_series(df, name, wcol=None):
+        dcol = f"nearest_{name}_distance"
+        tcol = f"nearest_{name}_time"
+        valid = df[dcol].notna() & df[tcol].notna() & (df[dcol] > 0) & (df[tcol] >= 0)
+        if wcol:
+            valid = valid & df[wcol].notna() & (df[wcol] > 0)
+        if not valid.any():
+            return pd.Series(index=df.index, dtype=float)
+        avg_dist = df.loc[valid, dcol].mean()
+        costs = []
+        for idx in df.index[valid]:
+            d, t = df.loc[idx, dcol], df.loc[idx, tcol]
+            costs.append(single_travel(d, t, avg_dist, vehicle)['total_cost_per_kg'])
+        return pd.Series(costs, index=df.index[valid])
+
+    if mode == 'divergence':
+        if not layer1_name:
+            raise ValueError("mode 'divergence' requires layer1_name")
+        out = layer2.copy()
+        col = output_col or f"cost_transport_{layer1_name}_to_{layer2_name}"
+        out[col] = _cost_series(layer2, layer1_name)
+        return out
+
+    if mode == 'convergence':
+        if not layer1_name or not weight:
+            raise ValueError("mode 'convergence' requires layer1_name and weight")
+        costs = _cost_series(layer1, layer2_name, weight)
+        temp = pd.DataFrame({
+            'dest': layer1[f"nearest_{layer2_name}_id"].astype(str),
+            'w': layer1[weight].astype(float),
+            'c': costs
+        }).dropna()
+        if temp.empty:
+            out = layer2.copy()
+            out[output_col or f"cost_transport_{layer1_name}_to_{layer2_name}"] = np.nan
+            return out
+        agg = temp.groupby('dest').apply(lambda g: (g['w'] * g['c']).sum() / g['w'].sum(), include_groups=False)
+        out = layer2.copy()
+        col = output_col or f"cost_transport_{layer1_name}_to_{layer2_name}"
+        out[col] = out[id_col].astype(str).map(agg)
+        return out
+
+    if mode == 'cross_exchange':
+        if any(x is None for x in [distance_matrix, time_matrix, weight_matrix]):
+            raise ValueError("mode 'cross_exchange' requires distance_matrix, time_matrix, weight_matrix")
+        n1, n2 = len(layer1), len(layer2)
+        if not all(x.shape == (n1, n2) for x in (distance_matrix, time_matrix, weight_matrix)):
+            raise ValueError("Matrix dimensions mismatch")
+        valid = np.isfinite(distance_matrix) & (distance_matrix > 0) & np.isfinite(time_matrix) & (time_matrix >= 0)
+        avg_dist = np.mean(distance_matrix[valid]) if valid.any() else 0.0
+        cost_matrix = np.full((n1, n2), np.nan)
+        for i in range(n1):
+            for j in range(n2):
+                if valid[i, j]:
+                    cost_matrix[i, j] = single_travel(distance_matrix[i, j], time_matrix[i, j], avg_dist, vehicle)['total_cost_per_kg']
+        wcost = np.full(n2, np.nan)
+        for j in range(n2):
+            w, c = weight_matrix[:, j], cost_matrix[:, j]
+            m = np.isfinite(w) & (w > 0) & np.isfinite(c)
+            if m.any():
+                wcost[j] = np.sum(w[m] * c[m]) / np.sum(w[m])
+        out = layer2.copy()
+        col = output_col or f"cost_transport_{layer1_name}_to_{layer2_name}"
+        out[col] = wcost
+        return out
+
+    raise ValueError("mode must be 'convergence', 'cross_exchange', or 'divergence'")
+
+def tracking(
+    layer1: gpd.GeoDataFrame,
+    layer2: gpd.GeoDataFrame,
+    mode: str,
+    layer1_name: str,
+    layer2_name: str,
+    weight: Optional[str] = None,
+    id_col: str = 'id_supply',
+) -> gpd.GeoDataFrame:
+    """
+    Transfer cost columns (starting with 'cost_') from layer1 to layer2 based on nearest assignment.
+    """
+    cost_cols = [c for c in layer1.columns if c.startswith('cost_')]
+    if not cost_cols:
+        return layer2.copy()
+
+    result = layer2.copy()
+    if result.empty:
+        for c in cost_cols:
+            result[f'{c}'] = np.nan
+        return result
+
+    if mode == 'convergence':
+        if weight is None:
+            raise ValueError("mode='convergence' requires weight")
+        nearest = f"nearest_{layer2_name}_id"
+        if nearest not in layer1.columns:
+            raise ValueError(f"Layer1 missing {nearest}")
+        temp = layer1[[nearest, weight] + cost_cols].copy().rename(columns={nearest: 'dest_id'})
+        for col in [weight] + cost_cols:
+            temp[col] = pd.to_numeric(temp[col], errors='coerce')
+        temp = temp.dropna(subset=['dest_id', weight] + cost_cols)
+        temp = temp[temp[weight] > 0]
+        if temp.empty:
+            for c in cost_cols:
+                result[f'origin_{c}'] = np.nan
+            return result
+        for c in cost_cols:
+            temp[f'wsum_{c}'] = temp[c] * temp[weight]
+            agg = temp.groupby('dest_id').agg(wsum=(f'wsum_{c}', 'sum'), wtotal=(weight, 'sum'))
+            result[f'origin_{c}'] = result[id_col].astype(str).map((agg['wsum'] / agg['wtotal']))
+        return result
+
+    # divergence
+    nearest = f"nearest_{layer1_name}_id"
+    if nearest not in result.columns:
+        raise ValueError(f"Layer2 missing {nearest}")
+    if id_col not in layer1.columns:
+        raise ValueError(f"Layer1 missing {id_col}")
+    map_df = layer1[[id_col] + cost_cols].set_index(id_col).apply(pd.to_numeric, errors='coerce')
+    result[nearest] = result[nearest].astype(str)
+    for c in cost_cols:
+        result[f'{c}'] = result[nearest].map(map_df[c])
+    return result
+
+def propagate(
+    layer1: gpd.GeoDataFrame,
+    allocation_matrix: np.ndarray,
+    exceptions: Optional[List[str]] = None,
+) -> gpd.GeoDataFrame:
+    """
+    Propagate costs among storage facilities using the allocation matrix,
+    then compute final LPG price.
+
+    Automatically detects all columns starting with 'origin_' as the source costs
+    (e.g., origin_cost_import_sea). For each such column, creates a corresponding
+    column without the 'origin_' prefix (e.g., cost_import_sea) containing the
+    weighted average after rebalancing.
+
+    Parameters
+    ----------
+    layer1 : gpd.GeoDataFrame
+        GeoDataFrame with columns 'origin_{cost_name}' from upstream aggregation.
+        Must have the same number of rows as allocation_matrix.
+    allocation_matrix : np.ndarray
+        Square matrix (n x n) where element [i, j] is the percentage of product
+        sent from storage i to storage j.
+    exceptions : List[str], optional
+        Additional column names in layer1 to add to the final price. These are not
+        propagated via allocation; they are simply summed.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        Storage GeoDataFrame with:
+        - Allocated cost columns (without 'origin_' prefix)
+        - Final 'LPG_price' column
+    """
+    ps = layer1.copy()
+    n = len(ps)
+    if allocation_matrix.shape != (n, n):
+        raise ValueError(f"allocation_matrix shape {allocation_matrix.shape} != ({n},{n})")
+
+    # Automatically detect origin cost columns
+    origin_cols = [col for col in ps.columns if col.startswith('origin_')]
+    if not origin_cols:
+        raise ValueError("No columns starting with 'origin_' found. Run tracking with mode='convergence' first.")
+
+    # Derive cost component names (strip 'origin_' prefix)
+    cost_components = [col[7:] for col in origin_cols]  # len('origin_') = 7
+
+    # Initialize allocated cost columns
+    for comp in cost_components:
+        ps[comp] = np.nan
+
+    # Propagate: for each destination, weighted average of origin costs from senders
+    for j in range(n):
+        weights = allocation_matrix[:, j]
+        senders = np.where(weights > 0)[0]
+        if len(senders) == 0:
+            continue
+        w_sum = weights[senders].sum()
+        if w_sum <= 0:
+            continue
+        for comp in cost_components:
+            origin_vals = ps.iloc[senders][f'origin_{comp}'].to_numpy(dtype=float)
+            ps.loc[ps.index[j], comp] = float(np.nansum(origin_vals * weights[senders]) / w_sum)
+
+    # Handle exception columns (e.g., cost_storage_second, cost_rebalancing)
+    if exceptions is None:
+        exceptions = []
+    for exc in exceptions:
+        if exc not in ps.columns:
+            ps[exc] = 0.0
+        else:
+            ps[exc] = pd.to_numeric(ps[exc], errors='coerce').fillna(0.0)
+
+    # Compute final LPG price
+    cost_cols = cost_components + exceptions
+    ps['LPG_price'] = ps[cost_cols].sum(axis=1, min_count=1).fillna(0.0)
+
+    return ps
+
+def total(gdf: gpd.GeoDataFrame, output_col: str = 'LPG_price') -> gpd.GeoDataFrame:
+    """
+    Sum all columns starting with 'cost_' and create a new column with the total.
+
+    Parameters
+    ----------
+    gdf : gpd.GeoDataFrame
+        Input GeoDataFrame containing cost columns.
+    output_col : str, default 'LPG_price'
+        Name of the new column to store the sum.
+
+    Returns
+    -------
+    gpd.GeoDataFrame
+        A copy of the input GeoDataFrame with the additional output column.
+    """
+    df = gdf.copy()
+    # Select cost columns
+    cost_cols = [col for col in df.columns if col.startswith('cost_')]
+    if not cost_cols:
+        raise ValueError("No columns starting with 'cost_' found.")
+    # Sum across rows, fill NaN with 0
+    df[output_col] = df[cost_cols].fillna(0).sum(axis=1)
+    return df
