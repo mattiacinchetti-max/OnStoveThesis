@@ -59,7 +59,7 @@ def ports(gdf, import_cost_df):
     gdf['cost_pre_bottling'] = 0.0
 
     # 1. Sea Import Cost: Applied to all ports based on the base price
-    gdf['cost_import_sea'] = gdf['LPG_price'] * import_sea_rate
+    gdf['cost_import_sea'] = gdf['cost_source'] * import_sea_rate
 
     # 2. STS Cost: Applied if storage is available (LPG_compliance) but port is NOT VLGC compliant
     mask_sts = (gdf['LPG_compliance'] == True) & (gdf['VLGC_compliance'] == False)
@@ -68,28 +68,28 @@ def ports(gdf, import_cost_df):
     # 3. Pre-bottling Cost: Applied only if no nearby storage is available
     # It is calculated on the price already including sea import costs
     mask_no_storage = (gdf['LPG_compliance'] == False)
-    price_after_import = gdf['LPG_price'] + gdf['cost_import_sea']
+    price_after_import = gdf['cost_source'] + gdf['cost_import_sea']
     gdf.loc[mask_no_storage, 'cost_pre_bottling'] = price_after_import * pre_bottling_cost
 
     # Final Price Calculation: Sum of base price and all extra components
-    gdf['LPG_price'] = (
-        gdf['LPG_price'] + 
+    gdf['cost_source'] = (
+        gdf['cost_source'] + 
         gdf['cost_import_sea'] + 
         gdf['cost_sts'] + 
         gdf['cost_pre_bottling']
     )
 
     # Check for remaining missing prices
-    missing_prices = int(gdf['LPG_price'].isna().sum())
+    missing_prices = int(gdf['cost_source'].isna().sum())
     if missing_prices > 0:
-        print(f"Warning: {missing_prices} port rows have missing LPG_price after cost calculation")
+        print(f"Warning: {missing_prices} port rows have missing cost_source after cost calculation")
 
     return gdf
 
 def border_points(gdf, import_cost_df, vehicle: Vehicle):
     """
     Calculates Land Import costs, Border Time costs, and Ferry costs.
-    Updates final LPG_price and stores individual components as attributes.
+    Updates final cost_source and stores individual components as attributes.
     """
     bp = gdf.copy()
     
@@ -100,7 +100,7 @@ def border_points(gdf, import_cost_df, vehicle: Vehicle):
 
     # 1. Land Import Cost (Percentage markup on base price)
     import_land_rate = float(import_cost_df.loc['import_land'].iloc[0])
-    bp['cost_import_land'] = bp['LPG_price'] * import_land_rate
+    bp['cost_import_land'] = bp['cost_source'] * import_land_rate
 
     # Logistics constants for cost calculation
     effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
@@ -125,8 +125,8 @@ def border_points(gdf, import_cost_df, vehicle: Vehicle):
             bp.loc[is_ferry, 'cost_ferry'] = ferry_extra_cost_trip / effective_load_kg
 
     # Update final price
-    bp['LPG_price'] = (
-        bp['LPG_price'] + 
+    bp['cost_source'] = (
+        bp['cost_source'] + 
         bp['cost_import_land'] + 
         bp['cost_border_wait'] + 
         bp['cost_ferry']
@@ -628,7 +628,7 @@ def propagate(
     gpd.GeoDataFrame
         Storage GeoDataFrame with:
         - Allocated cost columns (without 'origin_' prefix)
-        - Final 'LPG_price' column
+        - Final 'cost_source' column
     """
     ps = layer1.copy()
     n = len(ps)
@@ -671,11 +671,11 @@ def propagate(
 
     # Compute final LPG price
     cost_cols = cost_components + exceptions
-    ps['LPG_price'] = ps[cost_cols].sum(axis=1, min_count=1).fillna(0.0)
+    ps['cost_source'] = ps[cost_cols].sum(axis=1, min_count=1).fillna(0.0)
 
     return ps
 
-def total(gdf: gpd.GeoDataFrame, output_col: str = 'LPG_price') -> gpd.GeoDataFrame:
+def total(gdf: gpd.GeoDataFrame, output_col: str = 'cost_source') -> gpd.GeoDataFrame:
     """
     Sum all columns starting with 'cost_' and create a new column with the total.
 
@@ -683,7 +683,7 @@ def total(gdf: gpd.GeoDataFrame, output_col: str = 'LPG_price') -> gpd.GeoDataFr
     ----------
     gdf : gpd.GeoDataFrame
         Input GeoDataFrame containing cost columns.
-    output_col : str, default 'LPG_price'
+    output_col : str, default 'cost_source'
         Name of the new column to store the sum.
 
     Returns

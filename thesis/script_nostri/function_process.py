@@ -78,7 +78,7 @@ def fill_from_buffer(gdf, default_gdf, cols, buffer_km=BUFFER_KM):
 
 def fill_lpg_price_from_raster(gdf, raster_path, band_index=1, overwrite=False):
     """
-    Sample a raster at facility locations and fill LPG_price.
+    Sample a raster at facility locations and fill cost_source.
     Handles non-point geometries via centroids.
     Only fills missing values unless overwrite=True.
     """
@@ -87,8 +87,8 @@ def fill_lpg_price_from_raster(gdf, raster_path, band_index=1, overwrite=False):
     if out.crs is None:
         raise ValueError("Input GeoDataFrame has no CRS")
 
-    if 'LPG_price' not in out.columns:
-        out['LPG_price'] = np.nan
+    if 'cost_source' not in out.columns:
+        out['cost_source'] = np.nan
 
     raster_file = Path(raster_path)
     if not raster_file.exists():
@@ -129,9 +129,9 @@ def fill_lpg_price_from_raster(gdf, raster_path, band_index=1, overwrite=False):
     if overwrite:
         mask = sampled_series.notna()
     else:
-        mask = out['LPG_price'].isna() & sampled_series.notna()
+        mask = out['cost_source'].isna() & sampled_series.notna()
 
-    out.loc[mask, 'LPG_price'] = sampled_series.loc[mask]
+    out.loc[mask, 'cost_source'] = sampled_series.loc[mask]
     return out
 
 def redistribute_small_national_shares(nat_shares_df, min_share_pct=1.0):
@@ -171,10 +171,10 @@ def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     gdf = gdf.copy()
 
     # Phase 1: Fill from buffer
-    fill_cols = ['crude_capacity', 'LPG_price']
+    fill_cols = ['crude_capacity', 'cost_source']
     gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure production and fill LPG_price from raster
+    # Phase 2: Ensure production and fill cost_source from raster
     if 'crude_capacity' not in gdf.columns:
         gdf['crude_capacity'] = 0.0
     else:
@@ -182,9 +182,9 @@ def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1):
 
     gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False)
 
-    missing_prices = int(gdf['LPG_price'].isna().sum())
+    missing_prices = int(gdf['cost_source'].isna().sum())
     if missing_prices > 0:
-        print(f"Warning: {missing_prices} refinery rows still have missing LPG_price after raster sampling")
+        print(f"Warning: {missing_prices} refinery rows still have missing cost_source after raster sampling")
 
     return gdf
 
@@ -199,10 +199,10 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     gdf = gdf.copy()
 
     # Phase 1: Fill from buffer
-    fill_cols = ['LPG_prod', 'LPG_price']
+    fill_cols = ['LPG_prod', 'cost_source']
     gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure production and fill LPG_price from raster
+    # Phase 2: Ensure production and fill cost_source from raster
     if 'LPG_prod' not in gdf.columns:
         gdf['LPG_prod'] = 0.0
     else:
@@ -210,9 +210,9 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path, price_band=1):
 
     gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False)
 
-    missing_prices = int(gdf['LPG_price'].isna().sum())
+    missing_prices = int(gdf['cost_source'].isna().sum())
     if missing_prices > 0:
-        print(f"Warning: {missing_prices} gas plant rows still have missing LPG_price after raster sampling")
+        print(f"Warning: {missing_prices} gas plant rows still have missing cost_source after raster sampling")
 
     return gdf
 
@@ -225,12 +225,12 @@ def ports(gdf, default_gdf, storage_gdf, lpg_price_raster_path, price_band=1):
     gdf = gdf.copy()
 
     # Phase 1: Fill missing values from buffer
-    fill_cols = ['VLGC_compliance', 'LPG_price']
+    fill_cols = ['VLGC_compliance', 'cost_source']
     gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure LPG_price exists and sample from raster
-    if 'LPG_price' not in gdf.columns:
-        gdf['LPG_price'] = np.nan
+    # Phase 2: Ensure cost_source exists and sample from raster
+    if 'cost_source' not in gdf.columns:
+        gdf['cost_source'] = np.nan
     gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False)
 
     # Phase 3: Initialize spatial and technical fields
@@ -284,7 +284,7 @@ def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     """
     Ensure storage capacity fields exist and are numeric.
     Fills LPG_capacity from nearby defaults when missing.
-    Initializes LPG_price as NaN for later steps.
+    Initializes cost_source as NaN for later steps.
     Returns a cleaned GeoDataFrame in the original CRS.
     """
     gdf = gdf.copy()
@@ -299,7 +299,7 @@ def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     else:
         gdf['LPG_capacity'] = gdf['LPG_capacity'].fillna(0.0)
 
-    gdf['LPG_price'] = np.nan
+    gdf['cost_source'] = np.nan
 
     return gdf
 
@@ -312,19 +312,19 @@ def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, price_
     bp = gdf.copy()
 
     if bp.empty:
-        for col in ['LPG_price', 'osbp', 'border_ferry', 'percentage', 'category']:
+        for col in ['cost_source', 'osbp', 'border_ferry', 'percentage', 'category']:
             bp[col] = pd.Series(dtype='float64' if col not in ['osbp', 'border_ferry', 'category'] else 'object')
         return bp
 
     # Phase 1: Initialize columns and handle missing data
-    if 'LPG_price' not in bp.columns: bp['LPG_price'] = np.nan
+    if 'cost_source' not in bp.columns: bp['cost_source'] = np.nan
     if 'osbp' not in bp.columns: 
         bp['osbp'] = np.nan
     if 'border_ferry' not in bp.columns: 
         bp['border_ferry'] = np.nan
 
     # Phase 2: Fill from buffer and raster
-    bp = fill_from_buffer(bp, default_gdf, ['LPG_price', 'osbp', 'border_ferry'])
+    bp = fill_from_buffer(bp, default_gdf, ['cost_source', 'osbp', 'border_ferry'])
     bp = fill_lpg_price_from_raster(bp, lpg_price_raster_path, band_index=price_band, overwrite=False)
 
     bp['osbp'] = bp['osbp'].replace('', np.nan).fillna('no')
