@@ -306,7 +306,7 @@ class Technology:
         pollutants = ['co2', 'ch4', 'n2o', 'co', 'bc', 'oc']
         self.carbon_intensity = sum([self[f'{pollutant}_intensity'] * model.gwp[pollutant] for pollutant in pollutants])
 
-    def carb(self, model: 'onstove.OnStove'):
+    def carb(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """Checks if carbon_emission is given in the socio-economic specification file. If it is given this is read
         directly, otherwise the get_carbon_intensity function is called. Function does not return anything but saves the
         carbon_emissions in the `carbon` attribute of the OnStove model object.
@@ -330,7 +330,7 @@ class Technology:
         self.carbon = pd.Series([(self.energy * self.carbon_intensity) / 1000] * model.gdf.shape[0],
                                 index=model.gdf.index)
 
-    def carbon_emissions(self, model: 'onstove.OnStove'):
+    def carbon_emissions(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """Calculates the reduced emissions and the costs avoided by reducing these emissions. Function does not return
         anything but the reduced emissions and avoided costs are saved in the `decreased_carbon_emissions` and
         `decreased_carbon_costs` attributes of the OnStove model object respectively
@@ -347,7 +347,7 @@ class Technology:
         required_energy
         get_carbon_intensity
         """
-        self.carb(model)
+        self.carb(model, improved_supply_chain=improved_supply_chain)
         proj_life = model.specs['end_year'] - model.specs['start_year']
         carbon = model.specs["cost_of_carbon_emissions"] * (model.base_fuel.carbon - self.carbon) / 1000 / (
                 1 + model.specs["discount_rate"]) ** (proj_life)
@@ -601,7 +601,7 @@ class Technology:
         self.discounted_investments = pd.Series(investments_discounted, index=model.gdf.index) + self.inv_cost - \
                                       discounted_base_investments
 
-    def discount_fuel_cost(self, model: 'onstove.OnStove', relative: bool = True, improved_supply_chain: bool = False):
+    def discount_fuel_cost(self, model: 'onstove.OnStove', relative: bool = False, improved_supply_chain: bool = False):
         """Calls discount_factor function and calculates discounted fuel costs. Function does not return anything but
         saves the discounted fuel cost in the `discounted_fuel_cost` attribute of the Onstove model object.
 
@@ -623,10 +623,7 @@ class Technology:
         self.required_energy(model)
         discount_rate, proj_life = self.discount_factor(model.specs)
 
-        if improved_supply_chain and self.name == 'LPG':
-            cost = (self.energy * model.gdf['LPG_user_cost'] / self.energy_content) # Transport cost already included in the user cost for LPG, so not added here
-        else:
-            cost = (self.energy * self.fuel_cost / self.energy_content + self.transport_cost) * np.ones(model.gdf.shape[0])
+        cost = (self.energy * self.fuel_cost / self.energy_content + self.transport_cost) * np.ones(model.gdf.shape[0])
         fuel_cost = [np.ones(proj_life) * x for x in cost]
 
         fuel_cost_discounted = np.array([sum(x / discount_rate) for x in fuel_cost])
@@ -995,31 +992,27 @@ class LPG(Technology):
         self.transport_cost = transport_cost
 
     def discount_fuel_cost(self, model: 'onstove.OnStove', relative: bool = True, improved_supply_chain: bool = False):
-        """This method expands :meth:`discount_fuel_cost` when LPG is the stove assessed in order to ensure that the
-        transportation costs are included
+        if improved_supply_chain:
+            self.required_energy(model)
+            discount_rate, proj_life = self.discount_factor(model.specs)
 
-        Parameters
-        ----------
-        model: OnStove model
-            Instance of the OnStove model containing the main data of the study case. See
-            :class:`onstove.OnStove`.
-        relative: bool, default True
-            Boolean parameter to indicate if the discounted investments will be calculated relative to the `base_fuel`
-            or not.
-        improved_supply_chain: bool, default False
-            Boolean parameter to indicate if the fuel cost for LPG should be calculated with the improved supply chain cost (i.e. user cost) or not. 
+            # Transport cost already included in the user cost for LPG
+            cost = (self.energy * model.gdf['LPG_user_cost'] / self.energy_content)
+            fuel_cost = [np.ones(proj_life) * x for x in cost]
 
-        See also
-        --------
-        discount_fuel_cost
-        """
+            fuel_cost_discounted = np.array([sum(x / discount_rate) for x in fuel_cost])
 
-        if not improved_supply_chain:
+            if relative:
+                discounted_base_fuel_cost = model.base_fuel.discounted_fuel_cost
+            else:
+                discounted_base_fuel_cost = 0
+
+            self.discounted_fuel_cost = pd.Series(fuel_cost_discounted, index=model.gdf.index) - discounted_base_fuel_cost
+        else:
             self.transportation_cost(model)
+            super().discount_fuel_cost(model, relative=relative)
 
-        super().discount_fuel_cost(model, relative, improved_supply_chain=improved_supply_chain)
-
-    def transport_emissions(self, model: 'onstove.OnStove'):
+    def transport_emissions(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """Calculates the emissions caused by the transportation of LPG. This is dependent on the diesel consumption of
         the truck. Diesel consumption is assumed to be 14 l/h (14 l/100km). Each truck is assumed to transport 2,000
         kg LPG
@@ -1055,9 +1048,9 @@ class LPG(Technology):
         diesel_consumption = self.travel_time * (14 / 1000) * diesel_density  # kg of diesel per trip
         hh_emissions = sum([ef * model.gwp[pollutant] * diesel_consumption / self.truck_capacity * kg_yr for
                             pollutant, ef in diesel_ef.items()])  # in gCO2eq per yr
-        return hh_emissions / 1000  # in kgCO2eq per yr
+        return hh_emissions / 1000 * (not improved_supply_chain)  # in kgCO2eq per yr
 
-    def carb(self, model: 'onstove.OnStove'):
+    def carb(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """This method expands :meth:`Technology.carbon` when LPG is the stove assessed in order to ensure that the
          emissions caused by the transportation is included.
 
@@ -1071,8 +1064,8 @@ class LPG(Technology):
         --------
         transport_emissions
         """
-        super().carb(model)
-        self.carbon += self.transport_emissions(model)
+        super().carb(model, improved_supply_chain=improved_supply_chain)
+        self.carbon += self.transport_emissions(model, improved_supply_chain=improved_supply_chain)
 
     def infrastructure_cost(self, model: 'onstove.OnStove'):
         """Calculates cost of cylinders for first-time LPG users. It is assumed that the cylinder contains 12.5 kg of
@@ -1585,7 +1578,7 @@ class Charcoal(Technology):
                             emission_factors.items()])  # gCO2eq/yr
         return hh_emissions / 1000  # kgCO2/yr
 
-    def carb(self, model: 'onstove.OnStove'):
+    def carb(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """This method expands :meth:`Technology.carbon` when Charcoal is the fuel used (both traditional stoves and
         ICS) to ensure that the emissions caused by the production and transportation is included in the total
         emissions.
@@ -1600,7 +1593,7 @@ class Charcoal(Technology):
         --------
         carbon
         """
-        super().carb(model)
+        super().carb(model, improved_supply_chain=improved_supply_chain)
         self.carbon += self.production_emissions(model)
 
 
@@ -1791,7 +1784,7 @@ class Electricity(Technology):
         # TODO: vectorize this
         return salvage / discount_rate[0]
 
-    def carb(self, model: 'onstove.OnStove'):
+    def carb(self, model: 'onstove.OnStove', improved_supply_chain: bool = False):
         """This method expands :meth:`Technology.carbon` when electricity is the fuel used
 
          Parameters
@@ -1806,7 +1799,7 @@ class Electricity(Technology):
          """
         if self.carbon_intensity is None:
             self.get_carbon_intensity(model)
-        super().carb(model)
+        super().carb(model, improved_supply_chain=improved_supply_chain)
 
     def discounted_inv(self, model: 'onstove.OnStove', relative: bool = True):
         """This method expands :meth:`Technology.discounted_inv` by adding connection and added capacity costs.

@@ -1563,6 +1563,7 @@ class OnStove(DataProcessor):
             techs: Optional[list] = None,
             baseline_map: Optional[gpd.GeoDataFrame] = None,
             column_map: Optional[dict[str, str]] = None,
+            improved_supply_chain: bool = False
             ) -> None:
         """Defines the base fuel properties according to the technologies currently used in the study area.
 
@@ -1601,7 +1602,7 @@ class OnStove(DataProcessor):
         # Ignore
         if len(base_fuels) == 1:
             self.base_fuel = copy(list(base_fuels.values())[0])
-            self.base_fuel.carb(self)
+            self.base_fuel.carb(self, improved_supply_chain=improved_supply_chain)
             self.base_fuel.total_time(self)
             self.base_fuel.required_energy(self)
             self.base_fuel.adjusted_pm25()
@@ -1648,7 +1649,7 @@ class OnStove(DataProcessor):
 
             for name, tech in base_fuels.items():
 
-                tech.carb(self)
+                tech.carb(self, improved_supply_chain=improved_supply_chain)
                 if name != "Biogas":
                     tech.total_time(self)
                 else:
@@ -1670,7 +1671,7 @@ class OnStove(DataProcessor):
                 base_fuel.inv_cost += tech.inv_cost * tech.pop_sqkm
                 base_fuel.om_cost += tech.om_cost * tech.pop_sqkm
 
-                tech.discount_fuel_cost(self, relative=False)
+                tech.discount_fuel_cost(self, relative=False, improved_supply_chain=improved_supply_chain)
                 base_fuel.discounted_fuel_cost += tech.discounted_fuel_cost * tech.pop_sqkm
 
                 for paf in ['paf_alri', 'paf_copd', 'paf_ihd', 'paf_lc', 'paf_stroke']:
@@ -2177,7 +2178,7 @@ class OnStove(DataProcessor):
         if self.base_fuel is None:
             print(f'[{self.specs["country_name"]}] Calculating base fuel properties')
 
-            self.set_base_fuel(list(self.techs.values()))
+            self.set_base_fuel(list(self.techs.values()), improved_supply_chain=improved_supply_chain)
         if technologies == 'all':
             techs = [tech for tech in self.techs.values()]
         elif isinstance(technologies, list):
@@ -2206,7 +2207,7 @@ class OnStove(DataProcessor):
             tech.morbidity(self)
             tech.mortality(self)
             print(f'Calculating carbon emissions benefits for {tech.name}...')
-            tech.carbon_emissions(self)
+            tech.carbon_emissions(self, improved_supply_chain=improved_supply_chain)
             print(f'Calculating time saved benefits for {tech.name}...')
             tech.time_saved(self)
             print(f'Calculating costs for {tech.name}...')
