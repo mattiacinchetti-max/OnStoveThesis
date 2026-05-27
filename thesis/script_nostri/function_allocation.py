@@ -403,10 +403,10 @@ def calculate_percentages_supply(refineries_gdf, ports_gdf, gas_plants_gdf, bord
         if 'name' not in gdf.columns:
             gdf['name'] = [f'{src_name}_{idx}' for idx in gdf.index]
 
-        if 'LPG_price' not in gdf.columns:
-            gdf['LPG_price'] = np.nan
+        if 'cost_source' not in gdf.columns:
+            gdf['cost_source'] = np.nan
         else:
-            gdf['LPG_price'] = pd.to_numeric(gdf['LPG_price'], errors='coerce')
+            gdf['cost_source'] = pd.to_numeric(gdf['cost_source'], errors='coerce')
 
         if 'country' not in gdf.columns:
             gdf['country'] = 'Unknown'
@@ -433,10 +433,10 @@ def calculate_percentages_supply(refineries_gdf, ports_gdf, gas_plants_gdf, bord
     if 'name' not in border.columns:
         border['name'] = [f'border_points_{idx}' for idx in border.index]
 
-    if 'LPG_price' not in border.columns:
-        border['LPG_price'] = np.nan
+    if 'cost_source' not in border.columns:
+        border['cost_source'] = np.nan
     else:
-        border['LPG_price'] = pd.to_numeric(border['LPG_price'], errors='coerce')
+        border['cost_source'] = pd.to_numeric(border['cost_source'], errors='coerce')
 
     if 'country' not in border.columns:
         border['country'] = 'Unknown'

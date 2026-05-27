@@ -263,24 +263,27 @@ def export_gpkg(points, data_dir, stage=""):
         gdf.to_file(output_path, layer=name, driver="GPKG", mode=current_mode)
         written += 1
 
-def combine_supply_layers(points: dict) -> gpd.GeoDataFrame:
+def combine_layers(points: dict, keys: list) -> gpd.GeoDataFrame:
     """
-    Combines the supply layers (refineries, ports, gas_plants, border_points)
-    in a single GeoDataFrame with necessary columns for transport cost calculation.
+    Combines layers in a single GeoDataFrame 
+    with necessary columns for transport cost calculation.
     """
-    supply_keys = ['refineries', 'ports', 'gas_plants', 'border_points']
     layers = []
-    for key in supply_keys:
+    for key in keys:
         gdf = points.get(key)
         if gdf is not None and not gdf.empty:
             gdf = gdf.copy()
             gdf['supply_category'] = key   
             layers.append(gdf)
+    
     if not layers:
         return gpd.GeoDataFrame()
+    
     combined = pd.concat(layers, ignore_index=True)
-    # ensure presence of fundamental columns 
-    for col in ['percentage_supply', 'nearest_primary_storage_id', 'nearest_primary_storage_distance', 'nearest_primary_storage_time']:
-        if col not in combined.columns:
-            combined[col] = np.nan
+    
+    # Fill NaN values in cost columns with 0
+    cost_cols = [c for c in combined.columns if c.startswith('cost_')]
+    for col in cost_cols:
+        combined[col] = combined[col].fillna(0.0)
+    
     return gpd.GeoDataFrame(combined, crs=layers[0].crs)
