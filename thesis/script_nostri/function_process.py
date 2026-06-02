@@ -217,32 +217,36 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     return gdf
 
 
-def ports(gdf, default_gdf, storage_gdf, lpg_price_raster_path, price_band=1):
+def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, only_phase4 = False):
     """
     Handles data cleaning, spatial linking with storage facilities, 
     and sampling the base LPG price from the raster.
     """
     gdf = gdf.copy()
 
-    # Phase 1: Fill missing values from buffer
-    fill_cols = ['VLGC_compliance', 'cost_source']
-    gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
+    if not only_phase4:
+        if lpg_price_raster_path is None and default_gdf is None:
+            raise ValueError("lpg_price_raster_path and default_gdf are required for ports when only_phase4=False")
 
-    # Phase 2: Ensure cost_source exists and sample from raster
-    if 'cost_source' not in gdf.columns:
-        gdf['cost_source'] = np.nan
-    gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False)
+        # Phase 1: Fill missing values from buffer
+        fill_cols = ['VLGC_compliance', 'cost_source']
+        gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 3: Initialize spatial and technical fields
-    gdf['LPG_capacity'] = 0.0
-    gdf['tanks_nearby'] = 0.0
-    gdf['LPG_compliance'] = False
+        # Phase 2: Ensure cost_source exists and sample from raster
+        if 'cost_source' not in gdf.columns:
+            gdf['cost_source'] = np.nan
+        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False)
 
-    # Ensure VLGC_compliance exists and handle NaNs
-    if 'VLGC_compliance' not in gdf.columns:
-        gdf['VLGC_compliance'] = False
-    else:
-        gdf['VLGC_compliance'] = gdf['VLGC_compliance'].fillna(False)
+        # Phase 3: Initialize spatial and technical fields
+        gdf['LPG_capacity'] = 0.0
+        gdf['tanks_nearby'] = 0.0
+        gdf['LPG_compliance'] = False
+
+        # Ensure VLGC_compliance exists and handle NaNs
+        if 'VLGC_compliance' not in gdf.columns:
+            gdf['VLGC_compliance'] = False
+        else:
+            gdf['VLGC_compliance'] = gdf['VLGC_compliance'].fillna(False)
 
     # Phase 4: Spatial join with storage facilities
     if storage_gdf is not None:
@@ -344,4 +348,234 @@ def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, price_
         bp['percentage'] = border_share * (weights / weights.sum())
         
     return bp
+
+#new mattia part
+import io
+import contextlib
+import shutil
+import numpy as np
+import xarray as xr
+import rioxarray
+from rasterio.warp import Resampling
+from scipy.ndimage import gaussian_filter
+from onstove import OnStove
+
+import function_tools as tool
+from parameters import (
+    INCOME_GINI_VALUE, INCOME_GDP_PC_VALUE, INCOME_PARETO_WEIGHT, 
+    VEHICLE_INCOME_EXPONENT, VEHICLE_TARGET_TOTAL, VEHICLE_F_URBAN, 
+    VEHICLE_F_RURAL, URBAN_THRESHOLD, MIN_VEHICLE_SHARE
+)
+
+def generate_income_raster(model_pickle_path, scenario_csv_path, output_directory, output_raster_name="income_nigeria", output_variable="absolute_wealth"):
+    """Estimates income utilizing the OnStove AWE method and outputs a base income raster, houseold-annual wealth in USD."""
+    os.makedirs(output_directory, exist_ok=True)
+    
+    model = OnStove.read_model(model_pickle_path)
+    model.read_scenario_data(scenario_csv_path, delimiter=",")
+    model.output_directory = output_directory
+
+    model.specs["gini"] = float(INCOME_GINI_VALUE)
+    model.specs["gdp_pc"] = float(INCOME_GDP_PC_VALUE)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        model.income_estimation(awe=True, income_data=None, pareto_weight=INCOME_PARETO_WEIGHT)
+        model.to_raster(variable=output_variable)
+
+    src_name = f"{output_variable}_mean.tif"
+    src_path = os.path.join(output_directory, "Rasters", src_name)
+    dst_path = os.path.join(output_directory, f"{output_raster_name}.tif")
+
+    if os.path.exists(src_path):
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
+        os.replace(src_path, dst_path)
+    rasters_dir = os.path.join(output_directory, "Rasters")
+    if os.path.exists(rasters_dir):
+        shutil.rmtree(rasters_dir, ignore_errors=True)
+
+
+def awe_limitation_recovery(
+    income_da,
+    urban_raster_path,
+    output_nodata,
+    original_nodata=None,
+    population_raster_path=None,
+):
+    """
+    Recover missing pixels (NaNs) caused by OnStove AWE methodology limitations
+    using a two-tier approach: Spatial Gaussian Imputation (Local Mean) and 
+    Urban/Rural National Floor fallback.
+    """
+    data = income_da.values.astype(np.float32, copy=True)
+    valid_original = (np.isfinite(data)) & (data != output_nodata)
+    if original_nodata is not None:
+        valid_original &= (data != original_nodata)
+    valid_original &= (data > 0)
+
+    allowed_mask = np.ones_like(data, dtype=bool)
+    if population_raster_path is not None:
+        pop_da = rioxarray.open_rasterio(str(population_raster_path))
+        pop_da_aligned = pop_da.rio.reproject_match(income_da, resampling=Resampling.nearest)
+        pop_data = pop_da_aligned.values.astype(np.float32, copy=False)
+        pop_nodata = pop_da_aligned.rio.nodata
+        pop_da_aligned.close()
+        pop_da.close()
+
+        allowed_mask = np.isfinite(pop_data)
+        if pop_nodata is not None:
+            allowed_mask &= (pop_data != pop_nodata)
+    
+    urban_da = rioxarray.open_rasterio(str(urban_raster_path))
+    urban_da_aligned = urban_da.rio.reproject_match(income_da, resampling=Resampling.nearest)
+    urban_data = urban_da_aligned.values.astype(np.float32, copy=False)
+    urban_da_aligned.close()
+    urban_da.close()
+    
+    valid_original &= allowed_mask
+
+    data_clean = np.where(valid_original, data, 0.0)
+    weights = valid_original.astype(float)
+    filled_filtered = gaussian_filter(data_clean, sigma=2)
+    weights_filtered = gaussian_filter(weights, sigma=2)
+    spatial_imputed = filled_filtered / np.where(weights_filtered == 0, 1, weights_filtered)
+    
+    mean_rural_floor = np.mean(data[valid_original & (urban_data < URBAN_THRESHOLD)]) if np.any(valid_original & (urban_data < URBAN_THRESHOLD)) else 2053.34
+    mean_urban_floor = np.mean(data[valid_original & (urban_data >= URBAN_THRESHOLD)]) if np.any(valid_original & (urban_data >= URBAN_THRESHOLD)) else 4000.0
+    
+    is_missing = (~valid_original) & allowed_mask
+    data_imputed = data.copy()
+    
+    # Tier 1 Local Spatial Imputation
+    data_imputed = np.where(is_missing & (spatial_imputed > 0), spatial_imputed, data_imputed)
+    # Tier 2 Fixed Stratified Floor Fallback
+    still_missing = is_missing & (spatial_imputed == 0)
+    data_imputed = np.where(still_missing & (urban_data < URBAN_THRESHOLD), mean_rural_floor, data_imputed)
+    data_imputed = np.where(still_missing & (urban_data >= URBAN_THRESHOLD), mean_urban_floor, data_imputed)
+    
+    data_imputed[~allowed_mask] = output_nodata
+
+    valid = (np.isfinite(data_imputed)) & (data_imputed > 0) & allowed_mask
+    print(f"[AWE Recovery] Input Pixels: {valid_original.sum():,}, Recovered Pixels: {valid.sum():,}")
+    return data_imputed, valid
+
+
+def generate_vehicle_possibility(
+    input_path,
+    output_vehicle_path,
+    urban_raster_path,
+    population_raster_path=None,
+    target_crs="EPSG:3857",
+    target_resolution=1000,
+    output_nodata=-9999.0,
+):
+    """Reprojects the income raster, normalizes it, and calculates vehicle possession probabilities."""
+    income_da = rioxarray.open_rasterio(input_path)
+    original_nodata = income_da.rio.nodata
+
+    income_3857 = income_da.rio.reproject(
+        target_crs,
+        resolution=target_resolution,
+        resampling=Resampling.nearest
+    )
+    income_3857 = income_3857.fillna(output_nodata)
+    income_3857.rio.write_nodata(output_nodata, inplace=True)
+
+    data, valid = awe_limitation_recovery(
+        income_da=income_3857,
+        urban_raster_path=urban_raster_path,
+        output_nodata=output_nodata,
+        original_nodata=original_nodata,
+        population_raster_path=population_raster_path,
+    )
+
+    if valid.any():
+        vmin, vmax = data[valid].min(), data[valid].max()
+        if vmax > vmin:
+            data[valid] = (data[valid] - vmin) / (vmax - vmin)
+        else:
+            data[valid] = 0.0
+
+        data[valid] = np.clip(data[valid], 0.0, 1.0)
+        data[valid] = np.power(data[valid], VEHICLE_INCOME_EXPONENT, dtype=np.float32)
+        data[~valid] = output_nodata
+
+    vehicle_possibility = xr.DataArray(
+        data,
+        coords=income_3857.coords,
+        dims=income_3857.dims,
+        attrs=income_3857.attrs,
+        name="vehicle_possibility",
+    )
+    vehicle_possibility.rio.write_crs(target_crs, inplace=True)
+    vehicle_possibility.rio.write_nodata(output_nodata, inplace=True)
+    vehicle_possibility.rio.to_raster(output_vehicle_path, compress="DEFLATE", nodata=output_nodata)
+
+
+def _total_vehicles_for_alpha(alpha, s_norm, pop, F_arr, min_share):
+    """Internal helper to calculate total allocated vehicles via power relation logic."""
+    rates = np.power(s_norm, alpha, dtype=np.float64)
+    rates = np.where(rates < min_share, 0.0, rates)
+    vehicles = pop * rates / F_arr
+    return float(np.sum(vehicles, dtype=np.float64))
+
+
+def allocate_vehicles(vehicle_possibility_path, population_path, urban_raster_path, output_share_car_path, output_share_walk_path, output_cars_path, output_nodata=-9999.0):
+    """Allocates vehicle and walking distributions factoring urban vs. rural divides across populations."""
+    score_da = rioxarray.open_rasterio(vehicle_possibility_path)
+    pop_da = rioxarray.open_rasterio(population_path).rio.reproject_match(score_da, resampling=Resampling.nearest)
+    urban_da = rioxarray.open_rasterio(urban_raster_path).rio.reproject_match(score_da, resampling=Resampling.nearest)
+
+    score = score_da.values.astype(np.float64, copy=False)
+    pop = pop_da.values.astype(np.float64, copy=False)
+    urban = urban_da.values.astype(np.float64, copy=False)
+
+    valid = (np.isfinite(score) & np.isfinite(pop) & np.isfinite(urban) & (pop > 0))
+    if score_da.rio.nodata is not None: valid &= score != score_da.rio.nodata
+    if pop_da.rio.nodata is not None: valid &= pop != pop_da.rio.nodata
+    if urban_da.rio.nodata is not None: valid &= urban != urban_da.rio.nodata
+
+    s = score[valid]
+    s_min, s_max = float(np.min(s)), float(np.max(s))
+    s_norm = np.clip((s - s_min) / (s_max - s_min), 0.0, 1.0) if s_max > s_min else s
+    s_norm[int(np.argmax(s))] = 1.0
+
+    pop_valid = pop[valid]
+    F_valid = np.where(urban[valid] >= URBAN_THRESHOLD, VEHICLE_F_URBAN, VEHICLE_F_RURAL).astype(np.float64)
+
+    left, right = 0.0, 40.0
+    for _ in range(80):
+        mid = 0.5 * (left + right)
+        veh_mid = _total_vehicles_for_alpha(mid, s_norm, pop_valid, F_valid, MIN_VEHICLE_SHARE)
+        if veh_mid > VEHICLE_TARGET_TOTAL:
+            left = mid
+        else:
+            right = mid
+            
+    alpha = 0.5 * (left + right)
+    final_veh = _total_vehicles_for_alpha(alpha, s_norm, pop_valid, F_valid, MIN_VEHICLE_SHARE)
+    print(f"Calibration complete: Final Alpha={alpha:.4f}")
+    print(f"Allocated Vehicles: {final_veh:,.0f} (Target: {VEHICLE_TARGET_TOTAL:,})")
+    
+    raw_rates_valid = np.power(s_norm, alpha, dtype=np.float64)
+    rates_valid = np.where(raw_rates_valid < MIN_VEHICLE_SHARE, 0.0, raw_rates_valid)
+
+    share_car_percent = np.full(score.shape, output_nodata, dtype=np.float32)
+    walk_share_percent = np.full(score.shape, output_nodata, dtype=np.float32)
+    n_effettivo = np.full(score.shape, output_nodata, dtype=np.float32)
+    
+
+    share_car_percent[valid] = (rates_valid * 100.0).astype(np.float32)
+    walk_share_percent[valid] = (100.0 - share_car_percent[valid]).astype(np.float32)
+    n_effettivo[valid] = (pop_valid * rates_valid / F_valid).astype(np.float32)
+
+    def _save_and_cache(data, path, name):
+        da = xr.DataArray(data, coords=score_da.coords, dims=score_da.dims, name=name)
+        da.rio.write_crs(score_da.rio.crs, inplace=True)
+        da.rio.write_nodata(output_nodata, inplace=True)
+        da.rio.to_raster(path, compress="DEFLATE", nodata=output_nodata)
+
+    _save_and_cache(share_car_percent, output_share_car_path, "share_car_access")
+    _save_and_cache(walk_share_percent, output_share_walk_path, "walk_allocation_share")
+    _save_and_cache(n_effettivo, output_cars_path, "n_effettivo")
 

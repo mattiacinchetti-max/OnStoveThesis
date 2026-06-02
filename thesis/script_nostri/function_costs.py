@@ -20,6 +20,7 @@ from openpyxl import Workbook
 import warnings
 import contextlib
 import heapq
+from rasterio.transform import rowcol
 import io
 import json
 import math
@@ -627,6 +628,7 @@ def tracking(
     if id_col not in layer1.columns:
         raise ValueError(f"Layer1 missing {id_col}")
     map_df = layer1[[id_col] + cost_cols].set_index(id_col).apply(pd.to_numeric, errors='coerce')
+    map_df.index = map_df.index.astype(str)
     result[nearest] = result[nearest].astype(str)
     for c in cost_cols:
         result[f'{c}'] = result[nearest].map(map_df[c])
@@ -724,8 +726,400 @@ def total(gdf: gpd.GeoDataFrame, output_col: str = 'cost_total') -> gpd.GeoDataF
     df = gdf.copy()
     # Select cost columns
     cost_cols = [col for col in df.columns if col.startswith('cost_')]
+    if output_col in cost_cols:
+        cost_cols = [col for col in cost_cols if col != output_col]
     if not cost_cols:
         raise ValueError("No columns starting with 'cost_' found.")
     # Sum across rows, fill NaN with 0
     df[output_col] = df[cost_cols].fillna(0).sum(axis=1)
     return df
+
+
+#new part mattia
+# move to cost.py
+def filling(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Calculates the internal operating costs of the filling plant and adds it as 'cost_fil_plants'.
+    """
+    df = gdf.copy()
+    
+    # 1. Determine inbound cost (accumulated total cost up to this point)
+    cost_in = pd.to_numeric(df.get('cost_total', 0.0), errors='coerce').fillna(0.0)
+    
+    # 2. Compute Annualized Fixed Costs
+    crf_op = crf(discount_rate, op_license_validity_years_fill)
+    crf_fill = crf(discount_rate, lifetime_filling)
+    
+    annual_op_license = op_license_fee_usd_fill * crf_op
+    annual_cap_cost = overnight_filling_usd * crf_fill
+    
+    total_fixed_annual = (fom_annual_usd_fill + annual_op_license + 
+                          (annual_cap_cost * filling_allocation_fraction))
+    
+    fixed_cost_per_kg = total_fixed_annual / reference_filling_capacity_kg
+    added_cost_per_kg = fixed_cost_per_kg + vom_usd_per_kg_fill
+    
+    # 3. Apply operational loss factor to inbound cost
+    effective_in_cost = cost_in / (1.0 - loss_factor_fill)
+    
+    # 4. Outbound cost and markup cap
+    cost_out_uncapped = effective_in_cost + added_cost_per_kg
+    max_cost_out = cost_in * (1.0 + cost_increase_cap_pct)
+    
+    cost_out = np.where(cost_in > 0, np.minimum(cost_out_uncapped, max_cost_out), 0.0)
+    
+    # 5. Store specific filling plant cost component
+    df['cost_fil_plants'] = np.maximum(0.0, cost_out - cost_in)
+    
+    return df
+
+
+def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income_raster_path: str, pop_raster_path: str, urban_raster_path: str) -> gpd.GeoDataFrame:
+    """
+    Calculates the internal reseller shop cost (cost_res_shop) based on local income, 
+    estimated minimum wage, and system-wide average demand.
+    """
+    resell = resell_gdf.copy()
+    filling = filling_gdf.copy()
+    
+    # 1. System average demand calculation
+    assigned_col = next((c for c in ['assigned_fil_clients', 'total_fil_clients'] if c in filling.columns), None)
+    if assigned_col == 'assigned_fil_clients':
+        total_assigned_clients = pd.to_numeric(filling['assigned_fil_clients'], errors='coerce').fillna(0).sum()
+    elif assigned_col == 'total_fil_clients':
+        total_assigned_clients = (pd.to_numeric(filling['total_fil_clients'], errors='coerce').fillna(0).sum() - 
+                                  pd.to_numeric(filling.get('clients', 0), errors='coerce').fillna(0).sum())
+    else:
+        total_assigned_clients = 0.0
+        
+    n_resellers = len(resell)
+    if n_resellers == 0:
+        resell['cost_res_shop'] = 0.0
+        return resell
+        
+    avg_reseller_clients = max(0, total_assigned_clients) / n_resellers
+    
+    annual_kg_client = (meals_per_day * 365.0 * energy_per_meal_mj) / (efficiency * energy_content_mj_per_kg)
+    avg_reseller_demand_kg = avg_reseller_clients * annual_kg_client
+    
+    if avg_reseller_demand_kg <= 0:
+        resell['cost_res_shop'] = 0.0
+        return resell
+
+    # 2. Extract local income per capita using 2x2 raster window (vectorized)
+    resell_income_monthly = np.full(n_resellers, np.nan)
+
+    if (os.path.exists(income_raster_path)
+            and os.path.exists(urban_raster_path)):
+        with rasterio.open(income_raster_path) as inc_src, \
+            rasterio.open(urban_raster_path) as urb_src:
+
+            work_gdf = resell.to_crs(inc_src.crs)
+            xs = np.array([g.x if (g and not g.is_empty) else np.nan
+                        for g in work_gdf.geometry], dtype=np.float64)
+            ys = np.array([g.y if (g and not g.is_empty) else np.nan
+                        for g in work_gdf.geometry], dtype=np.float64)
+            valid_geom = np.isfinite(xs) & np.isfinite(ys)
+
+            if valid_geom.any():
+                # Convert all coordinates to (row, col) in one vectorised call
+                rows, cols = rowcol(inc_src.transform, xs[valid_geom], ys[valid_geom])
+                rows = rows.astype(np.int64)
+                cols = cols.astype(np.int64)
+
+                H, W = inc_src.height, inc_src.width
+
+                # Read the full raster once — much faster than N windowed reads
+                inc_full = inc_src.read(1).astype(np.float64)
+                urb_full = urb_src.read(1).astype(np.float64)
+
+                # For each reseller, average the valid 2x2 neighbourhood
+                inc_vals = np.full(valid_geom.sum(), np.nan)
+                for k, (r, c) in enumerate(zip(rows, cols)):
+                    r0, r1 = max(r - 1, 0), min(r + 1, H)   # clip to array bounds
+                    c0, c1 = max(c - 1, 0), min(c + 1, W)
+                    patch_inc = inc_full[r0:r1+1, c0:c1+1]
+                    patch_urb = urb_full[r0:r1+1, c0:c1+1]
+                    valid = np.isfinite(patch_inc) & (patch_inc > 0)
+                    if valid.any():
+                        inc_vals[k] = patch_inc[valid].mean()
+
+                resell_income_monthly[valid_geom] = inc_vals
+                    
+    # 3. Apply minimum wage floor
+    income_monthly_used = np.where(
+        np.isfinite(resell_income_monthly) & (resell_income_monthly > minimum_wage_usd_per_month),
+        resell_income_monthly,
+        minimum_wage_usd_per_month
+    )
+    
+    # 4. Fixed and Variable Retail Costs
+    annual_salary_usd = income_monthly_used * 12.0
+    total_fixed_annual = ((rent_per_month_usd_res * 12.0 + annual_salary_usd) * retail_allocation_fraction + license_annual_usd_res)
+    
+    fixed_cost_per_kg = total_fixed_annual / avg_reseller_demand_kg
+    added_cost_per_kg = fixed_cost_per_kg + vom_usd_per_kg_res
+    
+    # 5. Determine Reseller Cost component and cap
+    cost_in = pd.to_numeric(resell.get('cost_total', 0.0), errors='coerce').fillna(0.0)
+    
+    cost_out_uncapped = cost_in + added_cost_per_kg
+    max_cost_out = cost_in * (1.0 + cost_increase_cap_pct)
+    
+    cost_out = np.where(cost_in > 0, np.minimum(cost_out_uncapped, max_cost_out), 0.0)
+    
+    resell['cost_res_shop'] = np.maximum(0.0, cost_out - cost_in)
+    
+    return resell
+
+
+def _compute_spatial_vot(income_array: np.ndarray) -> np.ndarray:
+    """Computes the spatial Value of Time (VOT) based on local income."""
+    valid = np.isfinite(income_array)
+    vot = np.full(income_array.shape, default_vot_usd_per_hour, dtype=np.float32)
+    
+    if not np.any(valid):
+        return vot
+        
+    min_value = float(np.nanmin(income_array[valid]))
+    max_value = float(np.nanmax(income_array[valid]))
+    
+    if not np.isfinite(min_value) or not np.isfinite(max_value) or max_value <= min_value:
+        return vot
+        
+    wage_min, wage_max = wage_range
+    norm = (income_array - min_value) / (max_value - min_value)
+    norm = np.clip(norm, 0.0, 1.0)
+    
+    wage_factor = wage_min + norm * float(wage_max - wage_min)
+    vot_valid = wage_factor * (minimum_wage_usd_per_month / work_hours_per_month)
+    vot[valid] = vot_valid[valid].astype(np.float32)
+    
+    return vot
+
+
+def _build_cost_maps(points: dict):
+    """Builds reference cost dictionaries directly from the current in-memory points layer."""
+    resell = points['reseller_points']
+    filling = points['filling_points']
+    
+    map_resell_cost = dict(zip(
+        pd.to_numeric(resell['id_res&fil'], errors='coerce').dropna().astype(np.int64), 
+        pd.to_numeric(resell['cost_total'], errors='coerce').dropna().astype(float)
+    ))
+    
+    map_fill_cost = dict(zip(
+        pd.to_numeric(filling['id_res&fil'], errors='coerce').dropna().astype(np.int64), 
+        pd.to_numeric(filling['cost_total'], errors='coerce').dropna().astype(float)
+    ))
+    
+    fill_ref = resell.get('filling_reference', resell['id_res&fil'])
+    map_reseller_to_filling = dict(zip(
+        pd.to_numeric(resell['id_res&fil'], errors='coerce').dropna().astype(np.int64),
+        pd.to_numeric(fill_ref, errors='coerce').dropna().astype(np.int64)
+    ))
+    
+    return map_resell_cost, map_fill_cost, map_reseller_to_filling
+
+
+def _map_effective_cost(ids_int: np.ndarray, map_resell: dict, map_fill: dict) -> np.ndarray:
+    """Maps the effective outlet cost to the pixel grids."""
+    out = np.full(ids_int.shape, np.nan, dtype=np.float64)
+    valid = ids_int > 0
+    if not np.any(valid):
+        return out
+        
+    uniq, inv = np.unique(ids_int[valid], return_inverse=True)
+    mapped = np.array([map_resell.get(int(rid), map_fill.get(int(rid), np.nan)) for rid in uniq], dtype=np.float64)
+    out[valid] = mapped[inv]
+    
+    return out
+
+
+
+def end_user(points: dict, huff_raster_path: str|Path, income_raster_path: str|Path, 
+             pop_raster_path: str|Path,urban_raster_path: str|Path,  lpg_share_path: str|Path, output_path: str|Path, 
+             use_spatial_vot: bool = True):
+    """
+    Calculates unified end-user costs (walking and driving) and generates the 19-band final TIF.
+    """
+    # 1. Build dictionary mappings for quick cost lookup
+    map_resell_cost, map_fill_cost, map_reseller_to_filling = _build_cost_maps(points)
+    
+    # 2. Read the full 8-band Huff allocation raster efficiently
+    with rasterio.open(huff_raster_path) as src:
+        car_share = src.read(1).astype(np.float32)
+        walk_share = src.read(2).astype(np.float32)
+        walk_id = src.read(3).astype(np.float32)
+        walk_time = src.read(4).astype(np.float32)
+        walk_dist = src.read(5).astype(np.float32)
+        car_id = src.read(6).astype(np.float32)
+        car_time = src.read(7).astype(np.float32)
+        car_dist = src.read(8).astype(np.float32)
+        profile = src.profile.copy()
+        
+    height, width = walk_share.shape
+    n = height * width
+    
+    # 3. Read LPG Use Share
+    try:
+        lpg_use_share, _ = tool._read_single_band(lpg_share_path)
+    except Exception as e:
+        raise FileNotFoundError(f"Cannot read LPG use share raster: {lpg_share_path}") from e
+
+    # 4. Compute Spatial VOT if enabled
+    if use_spatial_vot and Path(income_raster_path).exists():
+        _, pop_profile = tool._read_single_band(pop_raster_path)
+        income_aligned = tool.reproject_to_reference(Path(income_raster_path), pop_profile, Resampling.bilinear)
+        urban_aligned = tool.reproject_to_reference(
+            Path(urban_raster_path), pop_profile, Resampling.nearest  
+        )
+        income_per_capita = tool.income_household_to_per_capita(        
+            income_aligned, urban_aligned
+        )
+        vot_raster = _compute_spatial_vot(income_per_capita) 
+    else:
+        vot_raster = np.full((height, width), default_vot_usd_per_hour, dtype=np.float32)
+        
+    vot_flat = vot_raster.reshape(-1).astype(np.float64)
+
+    # =========================================================
+    # A. WALK COST CALCULATION
+    # =========================================================
+    walk_id_flat = walk_id.reshape(-1).astype(np.float64)
+    walk_time_flat = walk_time.reshape(-1).astype(np.float64)
+    
+    with np.errstate(invalid='ignore'):
+        walk_id_int = np.where(np.isfinite(walk_id_flat) & (walk_id_flat > 0), walk_id_flat.astype(np.int64), -1)
+        
+    ref_cost_walk_arr = _map_effective_cost(walk_id_int, map_resell_cost, map_fill_cost)
+    
+    filling_id_walk_arr = np.full(n, -1, dtype=np.int32)
+    filling_cost_walk_arr = np.full(n, np.nan, dtype=np.float64)
+    valid_walk_id = (walk_id_int > 0)
+    
+    if np.any(valid_walk_id):
+        uniq_ids, inv = np.unique(walk_id_int[valid_walk_id], return_inverse=True)
+        fid_mapped = np.array([map_reseller_to_filling.get(int(rid), int(rid)) for rid in uniq_ids], dtype=np.int32)
+        fcost_mapped = np.array([map_fill_cost.get(int(fid), np.nan) for fid in fid_mapped], dtype=np.float64)
+        filling_id_walk_arr[valid_walk_id] = fid_mapped[inv]
+        filling_cost_walk_arr[valid_walk_id] = fcost_mapped[inv]
+        
+    # Strictly one-way time scaled to round-trip
+    walk_round_trip_hours = (2.0 * walk_time_flat) / 60.0
+    total_trip_time_hours_walk = walk_round_trip_hours + fixed_time_at_retailer_hours
+    collection_cost_per_kg_walk = (total_trip_time_hours_walk * vot_flat) / cylinder_weight_kg
+    
+    valid_walk_mask = (np.isfinite(ref_cost_walk_arr) & (walk_id_int > 0) & 
+                       np.isfinite(walk_round_trip_hours) & (walk_round_trip_hours >= 0) & np.isfinite(vot_flat))
+                       
+    cost_walk_final = np.full(n, np.nan, dtype=np.float64)
+    cost_walk_final[valid_walk_mask] = ref_cost_walk_arr[valid_walk_mask] + collection_cost_per_kg_walk[valid_walk_mask]
+
+    # =========================================================
+    # B. CAR COST CALCULATION
+    # =========================================================
+    car_id_flat = car_id.reshape(-1).astype(np.float64)
+    car_time_flat = car_time.reshape(-1).astype(np.float64)
+    car_dist_flat = car_dist.reshape(-1).astype(np.float64)
+    
+    with np.errstate(invalid='ignore'):
+        car_id_int = np.where(np.isfinite(car_id_flat) & (car_id_flat > 0), car_id_flat.astype(np.int64), -1)
+        
+    ref_cost_car_arr = _map_effective_cost(car_id_int, map_resell_cost, map_fill_cost)
+    
+    filling_id_car_arr = np.full(n, -1, dtype=np.int32)
+    filling_cost_car_arr = np.full(n, np.nan, dtype=np.float64)
+    valid_car_id = (car_id_int > 0)
+    
+    if np.any(valid_car_id):
+        uniq_ids, inv = np.unique(car_id_int[valid_car_id], return_inverse=True)
+        fid_mapped = np.array([map_reseller_to_filling.get(int(rid), int(rid)) for rid in uniq_ids], dtype=np.int32)
+        fcost_mapped = np.array([map_fill_cost.get(int(fid), np.nan) for fid in fid_mapped], dtype=np.float64)
+        filling_id_car_arr[valid_car_id] = fid_mapped[inv]
+        filling_cost_car_arr[valid_car_id] = fcost_mapped[inv]
+        
+    round_trip_distance_km_car = 2.0 * car_dist_flat
+    round_trip_drive_hours = (car_time_flat * 2.0) / 60.0
+    total_trip_time_hours_car = round_trip_drive_hours + fixed_time_at_retailer_hours
+    
+    vehicle_operating_cost_trip_usd = round_trip_distance_km_car * car_variable_cost_per_km
+    driver_time_cost_trip_usd = total_trip_time_hours_car * vot_flat
+    collection_cost_per_kg_car = (vehicle_operating_cost_trip_usd + driver_time_cost_trip_usd) / cylinder_weight_kg
+    
+    valid_driver_mask = (np.isfinite(ref_cost_car_arr) & (car_id_int > 0) & 
+                         np.isfinite(car_time_flat) & (car_time_flat >= 0) & 
+                         np.isfinite(car_dist_flat) & (car_dist_flat >= 0) & 
+                         np.isfinite(total_trip_time_hours_car) & np.isfinite(vot_flat))
+                         
+    cost_car_final = np.full(n, np.nan, dtype=np.float64)
+    cost_car_final[valid_driver_mask] = ref_cost_car_arr[valid_driver_mask] + collection_cost_per_kg_car[valid_driver_mask]
+
+    # =========================================================
+    # C. MEAN & MAJORITY AGGREGATIONS (modified)
+    # =========================================================
+    share_walk_arr = np.clip(walk_share.reshape(-1).astype(np.float64), 0.0, 1.0)
+    share_car_arr = np.clip(car_share.reshape(-1).astype(np.float64), 0.0, 1.0)
+    share_sum = share_walk_arr + share_car_arr
+    share_valid = share_sum > 0
+
+    share_walk_norm = np.zeros(n, dtype=np.float64)
+    share_car_norm = np.zeros(n, dtype=np.float64)
+    share_walk_norm[share_valid] = share_walk_arr[share_valid] / share_sum[share_valid]
+    share_car_norm[share_valid] = share_car_arr[share_valid] / share_sum[share_valid]
+
+    # --- NEW: only consider pixels where BOTH walk and car costs exist ---
+    both_costs_valid = np.isfinite(cost_walk_final) & np.isfinite(cost_car_final) & share_valid
+
+    mean_user_cost_flat = np.full(n, np.nan, dtype=np.float64)
+    if np.any(both_costs_valid):
+        total_weight = share_walk_norm[both_costs_valid] + share_car_norm[both_costs_valid]  # always 1 if shares valid
+        mean_user_cost_flat[both_costs_valid] = (
+            cost_walk_final[both_costs_valid] * share_walk_norm[both_costs_valid] +
+            cost_car_final[both_costs_valid]  * share_car_norm[both_costs_valid]
+        ) / total_weight
+
+    # Majority cost stays unchanged (or you could apply the same condition if desired)
+    majority_cost_flat = np.full(n, np.nan, dtype=np.float64)
+    walk_majority = (share_walk_norm > share_car_norm)
+    majority_cost_flat[walk_majority] = cost_walk_final[walk_majority]
+    car_majority = ~walk_majority & (share_walk_norm + share_car_norm > 0)
+    majority_cost_flat[car_majority] = cost_car_final[car_majority]
+
+    # =========================================================
+    # D. EXPORT TO 19-BAND TIF
+    # =========================================================
+    out_bands = [
+        car_share, walk_share,
+        np.where(np.isfinite(walk_id) & (walk_id >= 0), walk_id, np.nan),
+        walk_time, walk_dist,
+        np.where(np.isfinite(car_id) & (car_id >= 0), car_id, np.nan),
+        car_time, car_dist,
+        ref_cost_walk_arr.reshape(height, width).astype(np.float32),
+        ref_cost_car_arr.reshape(height, width).astype(np.float32),
+        cost_walk_final.reshape(height, width).astype(np.float32),
+        cost_car_final.reshape(height, width).astype(np.float32),
+        filling_id_walk_arr.reshape(height, width).astype(np.float32),
+        filling_id_car_arr.reshape(height, width).astype(np.float32),
+        filling_cost_walk_arr.reshape(height, width).astype(np.float32),
+        filling_cost_car_arr.reshape(height, width).astype(np.float32),
+        lpg_use_share.astype(np.float32),
+        majority_cost_flat.reshape(height, width).astype(np.float32),
+        mean_user_cost_flat.reshape(height, width).astype(np.float32)
+    ]
+    
+    out_names = [
+        "car_share", "walk_share", "best_reseller_id_walk", "best_time_walk_min", "best_distance_walk_km",
+        "best_reseller_id_car", "best_time_car_min", "best_distance_car_km",
+        "res_cost_kg_out_walk_ref", "res_cost_kg_out_car_ref",
+        "cost_kg_walker", "cost_kg_driver",
+        "filling_id_walk", "filling_id_car",
+        "cost_fil_kg_out_walk_ref", "cost_fil_kg_out_car_ref",
+        "lpg_use_share", "majority_cost_kg", "mean_user_cost"
+    ]
+    
+    tool.write_multiband_raster(Path(output_path), profile, out_bands, out_names)
+    
+    print(f"✓ 19-Band End-User Price TIF generated successfully: {output_path}")
+    print(f"  - Valid Walker pixels: {valid_walk_mask.sum():,}")
+    print(f"  - Valid Driver pixels: {valid_driver_mask.sum():,}")

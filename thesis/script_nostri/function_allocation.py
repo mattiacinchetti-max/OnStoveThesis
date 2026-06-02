@@ -43,43 +43,55 @@ import function_costs as cost
 import function_process as process
 from dataclasses import dataclass
 
-def build_surface(friction_path):
+def build_surface(friction_path, ref_profile=None):
     """
-    Build a surface from friction data and expose CRS utilities.
-    Converts friction values to hours/km and sets nodata to inf.
+    Build a surface from friction data.
+    If ref_profile is provided, reprojects the friction raster to match the reference grid.
     Returns the cost array, transform, geodesic helper, and CRS.
-    Use the returned CRS for routing projections.
     """
-    friction = RasterLayer(name='friction_surface', path=str(friction_path))
-    cost_layer = friction.data.astype(np.float64).copy()
-    cost_layer *= (1000.0 / 60.0)  # Convert to hours/km equivalent
+    if ref_profile is not None:
+        # Reproject on the fly to match the master reference (e.g., EPSG:3857)
+        cost_layer = tool.reproject_to_reference(friction_path, ref_profile, Resampling.nearest)
+        
+        # Handle nodata
+        cost_layer[np.isnan(cost_layer)] = np.inf
+        cost_layer[cost_layer < 0] = np.inf
+        
+        transform = ref_profile['transform']
+        crs_obj = ref_profile['crs']
+    else:
+        # Fallback to original logic if no reference is provided
+        friction = RasterLayer(name='friction_surface', path=str(friction_path))
+        cost_layer = friction.data.astype(np.float64).copy()
+        
+        nodata = friction.meta.get('nodata')
+        cost_layer[np.isnan(cost_layer)] = np.inf
+        if nodata is not None:
+            cost_layer[cost_layer == nodata] = np.inf
+        cost_layer[cost_layer < 0] = np.inf
+        
+        transform = friction.meta['transform']
+        crs_obj = friction.meta.get('crs')
     
-    nodata = friction.meta.get('nodata')
-    cost_layer[np.isnan(cost_layer)] = np.inf
-    if nodata is not None:
-        cost_layer[cost_layer == nodata] = np.inf
-    cost_layer[cost_layer < 0] = np.inf
-    
-    crs_obj = friction.meta.get('crs')
     use_geodesic = bool(getattr(crs_obj, 'is_geographic', False))
     geod = Geod(ellps='WGS84') if use_geodesic else None
     
-    return cost_layer, friction.meta['transform'], geod, crs_obj
+    return cost_layer, transform, geod, crs_obj
 
 
 def calculate_mcp_routes(origin_row, origin_col, dest_rows, dest_cols, cost_layer, transform, geod):
     """
     Compute travel time and path distance from one origin to many destinations.
     Uses MCP to find least-time paths on the cost surface.
-    Returns arrays of hours and km aligned to destination lists.
+    Returns arrays of minutes and km aligned to destination lists.
     Invalid destinations remain NaN.
     """
     max_row, max_col = cost_layer.shape
-    times_hours = np.full(len(dest_rows), np.nan, dtype=np.float64)
+    times_min = np.full(len(dest_rows), np.nan, dtype=np.float64)
     distances_km = np.full(len(dest_rows), np.nan, dtype=np.float64)
 
     if not (0 <= origin_row < max_row and 0 <= origin_col < max_col):
-        return times_hours, distances_km
+        return times_min, distances_km
 
     mcp = MCP_Geometric(cost_layer, fully_connected=True)
     cumulative_costs, _ = mcp.find_costs(starts=np.array([[origin_row, origin_col]], dtype=np.int64))
@@ -88,7 +100,7 @@ def calculate_mcp_routes(origin_row, origin_col, dest_rows, dest_cols, cost_laye
         if 0 <= d_row < max_row and 0 <= d_col < max_col:
             val = cumulative_costs[d_row, d_col]
             if np.isfinite(val):
-                times_hours[idx] = float(val)
+                times_min[idx] = float(val)
                 
                 path = mcp.traceback((d_row, d_col))
                 if len(path) <= 1:
@@ -110,7 +122,7 @@ def calculate_mcp_routes(origin_row, origin_col, dest_rows, dest_cols, cost_laye
                     dy = np.diff(ys)
                     distances_km[idx] = float(np.nansum(np.hypot(dx, dy)) / 1000.0)
                     
-    return times_hours, distances_km
+    return times_min, distances_km
 
 
 def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_path=None, surface_data=None):   # TODO remove if replaced by assign_nearest
@@ -220,9 +232,7 @@ def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_p
         tank_id_supply[valid] = storage_ids[best_tank_idx]
         tank_name[valid] = storage_names[best_tank_idx]
 
-        best_tt_hours = travel_matrix[valid_rows, best_tank_idx]
-        best_tt_min = best_tt_hours * 60.0
-        tank_traveltime[valid] = best_tt_min
+        tank_traveltime[valid] = travel_matrix[valid_rows, best_tank_idx]
 
         tank_distance[valid] = distance_matrix[valid_rows, best_tank_idx]
 
@@ -283,7 +293,7 @@ def assign_nearest(
     if surface_data is None:
         if friction_path is None:
             raise ValueError("Either surface_data or friction_path must be provided")
-        surface_data = build_cost_surface(friction_path)   # ensure function exists
+        surface_data = build_surface(friction_path)   # ensure function exists
     cost_layer, transform, geod, crs_obj = surface_data
     
     # Reproject both layers to the raster CRS
@@ -317,14 +327,14 @@ def assign_nearest(
     for i in range(n_origins):
         if o_rows[i] < 0 or o_cols[i] < 0:
             continue
-        times_h, dists = calculate_mcp_routes(
+        times_min, dists = calculate_mcp_routes(
             o_rows[i], o_cols[i],
             d_rows, d_cols,
             cost_layer, transform, geod
         )
-        # times_h in hours, dists in km
+        # times_min in minutes, dists in km
         for j in range(n_dests):
-            t = times_h[j] * 60.0  # convert to minutes
+            t = times_min[j]
             if np.isfinite(t) and t < best_times[j]:
                 best_times[j] = t
                 best_dists[j] = dists[j]
@@ -587,7 +597,7 @@ def build_storage_routing_matrices(primary_storage_gdf, friction_path):
         t_times, t_dists = calculate_mcp_routes(
             orig_row, orig_col, storage_rows, storage_cols, cost_layer, transform, geod
         )
-        travel_time_matrix[i, :] = t_times * 60.0  # Convert hours to minutes
+        travel_time_matrix[i, :] = t_times
         distance_matrix[i, :] = t_dists
     
     print(f"✓ Routing matrices computed for {n_storage} storage facilities\n")
@@ -730,3 +740,883 @@ def allocation_process(primary_storage_gdf, friction_path, output_excel_path):
         'total_demand': total_demand,
     }
 
+
+#new mattia part
+#function_allocation.py
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from rasterio.warp import Resampling
+from rasterio.features import geometry_mask
+import function_tools as tool
+
+from parameters import (
+    WALK_THRESHOLD_MIN, CAR_THRESHOLD_MIN, URBAN_SHARE, RURAL_SHARE,
+    URBAN_THRESHOLD, NODATA_FLOAT, NODATA_INT
+)
+
+def calibrate_demand_and_allocate_clients(
+    pixel_pref_path, pop_path, urban_path, boundary_path,
+    resell_gdf, filling_gdf, output_lpg_use_path
+):
+    """
+    Calibrates LPG demand based on urban/rural targets, generates an LPG use raster,
+    allocates clients to resellers, and aggregates total demand at filling points.
+    Returns: updated_resell_gdf, updated_filling_gdf
+    """
+    # 1. Load and Prepare Spatial Data
+    pixel_pref = tool._read_pixel_preference_raster(pixel_pref_path)
+    pop, pop_profile, _ = tool._read_raster(pop_path)
+    transform, crs = pop_profile["transform"], pop_profile["crs"]
+    height, width = pop.shape
+
+    urban = tool.reproject_to_reference(urban_path, pop_profile, Resampling.nearest)
+    urban = np.where(np.isfinite(urban), urban, np.nan).astype(np.float32)
+
+    boundary = gpd.read_file(boundary_path)
+    if boundary.crs != crs:
+        boundary = boundary.to_crs(crs)
+        
+    mask_nigeria = geometry_mask(
+        [boundary.geometry.union_all()], transform=transform, invert=True, out_shape=(height, width)
+    )
+    pop = np.where(np.isfinite(pop), np.maximum(pop, 0.0), np.nan).astype(np.float32)
+
+    # 2. Extract Valid Pixels & Calculate Client Shares
+    valid_pref = np.isfinite(pixel_pref["walk_share"]) & np.isfinite(pixel_pref["car_share"])
+    valid_pref &= ((pixel_pref["best_reseller_id_walk"] >= 0) | (pixel_pref["best_reseller_id_car"] >= 0))
+    
+    rows, cols = np.where(valid_pref)
+    rows, cols = rows.astype(np.int64), cols.astype(np.int64)
+
+    if rows.size == 0:
+        raise RuntimeError("No valid preference pixels found in multilayer raster.")
+
+    pixel_pop = pop[rows, cols].astype(np.float64)
+    valid_pop = np.isfinite(pixel_pop) & (pixel_pop > 0)
+    rows, cols, pixel_pop = rows[valid_pop], cols[valid_pop], pixel_pop[valid_pop]
+
+    walk_share = np.clip(pixel_pref["walk_share"][rows, cols].astype(np.float64), 0.0, 1.0)
+    car_share = np.clip(pixel_pref["car_share"][rows, cols].astype(np.float64), 0.0, 1.0)
+    share_sum = walk_share + car_share
+
+    valid_share = share_sum > 0
+    if not np.any(valid_share):
+        raise RuntimeError("Invalid walk/car shares: all pixels have zero total share.")
+    if not np.all(valid_share):
+        dropped = int(np.count_nonzero(~valid_share))
+        print(f"Warning: dropping {dropped:,} pixels with zero total share.")
+        rows = rows[valid_share]
+        cols = cols[valid_share]
+        pixel_pop = pixel_pop[valid_share]
+        walk_share = walk_share[valid_share]
+        car_share = car_share[valid_share]
+        share_sum = share_sum[valid_share]
+
+    walk_share /= share_sum
+    car_share /= share_sum
+
+    walk_time = pixel_pref["best_time_walk_min"][rows, cols].astype(np.float64)
+    car_time = pixel_pref["best_time_car_min"][rows, cols].astype(np.float64)
+    
+    walk_reseller_id = np.where(np.isfinite(pixel_pref["best_reseller_id_walk"][rows, cols]), pixel_pref["best_reseller_id_walk"][rows, cols], NODATA_INT).astype(np.int64)
+    car_reseller_id = np.where(np.isfinite(pixel_pref["best_reseller_id_car"][rows, cols]), pixel_pref["best_reseller_id_car"][rows, cols], NODATA_INT).astype(np.int64)
+
+    walk_eligible = np.isfinite(walk_time) & (walk_time <= WALK_THRESHOLD_MIN)
+    car_eligible = np.isfinite(car_time) & (car_time <= CAR_THRESHOLD_MIN)
+
+    urban_pixel = urban[rows, cols]
+    urban_flag = np.where(np.isfinite(urban_pixel), urban_pixel >= URBAN_THRESHOLD, False)
+    rural_flag = ~urban_flag
+
+    urban_pop_total = float(np.nansum(pixel_pop[urban_flag]))
+    rural_pop_total = float(np.nansum(pixel_pop[rural_flag]))
+
+    if urban_pop_total <= 0 or rural_pop_total <= 0:
+        raise RuntimeError("Urban or rural population total is zero. Check urban/pop alignment.")
+
+    urban_eligible_pop = float(np.nansum(pixel_pop[urban_flag] * (walk_share[urban_flag] * walk_eligible[urban_flag] + car_share[urban_flag] * car_eligible[urban_flag])))
+    rural_eligible_pop = float(np.nansum(pixel_pop[rural_flag] * (walk_share[rural_flag] * walk_eligible[rural_flag] + car_share[rural_flag] * car_eligible[rural_flag])))
+
+    urban_factor = (URBAN_SHARE * urban_pop_total) / urban_eligible_pop
+    rural_factor = (RURAL_SHARE * rural_pop_total) / rural_eligible_pop
+
+    eligible_weight = walk_share * walk_eligible.astype(np.float64) + car_share * car_eligible.astype(np.float64)
+    region_factor = np.where(urban_flag, urban_factor, rural_factor)
+
+    lpg_use_share_pixel = np.clip(region_factor * eligible_weight, 0.0, 1.0)
+    clients_walk_pixel = pixel_pop * walk_share * walk_eligible.astype(np.float64) * region_factor
+    clients_car_pixel = pixel_pop * car_share * car_eligible.astype(np.float64) * region_factor
+    clients_max_ideal_walk_pixel = pixel_pop * walk_share
+    clients_max_ideal_car_pixel = pixel_pop * car_share
+
+    # 3. Save LPG Use Raster (Still writes to disk as requested)
+    lpg_use_share_raster = np.zeros((height, width), dtype=np.float32)
+    lpg_use_share_raster[~mask_nigeria] = NODATA_FLOAT
+    lpg_use_share_raster[rows, cols] = lpg_use_share_pixel.astype(np.float32)
+    out_profile = pop_profile.copy()
+    out_profile.update(dtype="float32", count=1, nodata=NODATA_FLOAT)
+    with rasterio.open(output_lpg_use_path, "w", **out_profile) as dst:
+        dst.write(lpg_use_share_raster.astype(np.float32), 1)
+
+    # 4. Process Reseller Clients (In-Memory)
+    reseller_df = resell_gdf.copy()
+    if reseller_df.crs != crs:
+        reseller_df = reseller_df.to_crs(crs)
+        
+    reseller_df = reseller_df[reseller_df.geometry.notna() & (reseller_df.geometry.geom_type == "Point")].copy()
+    reseller_df["reseller_id"] = tool._read_reseller_ids(reseller_df).astype(np.int64)
+
+    walk_clients = (
+        pd.DataFrame({"reseller_id": walk_reseller_id, "clients_walk": clients_walk_pixel, "clients_max_ideal_walk": clients_max_ideal_walk_pixel})
+        .loc[lambda d: d["reseller_id"] >= 0].groupby("reseller_id", as_index=False).sum()
+    )
+    car_clients = (
+        pd.DataFrame({"reseller_id": car_reseller_id, "clients_car": clients_car_pixel, "clients_max_ideal_car": clients_max_ideal_car_pixel})
+        .loc[lambda d: d["reseller_id"] >= 0].groupby("reseller_id", as_index=False).sum()
+    )
+
+    clients_agg = walk_clients.merge(car_clients, on="reseller_id", how="outer").fillna(0.0)
+    clients_agg["clients"] = clients_agg["clients_walk"] + clients_agg["clients_car"]
+    clients_agg["clients_max_ideal"] = clients_agg["clients_max_ideal_walk"] + clients_agg["clients_max_ideal_car"]
+
+    client_cols = ["clients_walk", "clients_car", "clients", "clients_max_ideal_walk", "clients_max_ideal_car", "clients_max_ideal"]
+    reseller_out = reseller_df.merge(clients_agg, on="reseller_id", how="left")
+    for col in client_cols:
+        reseller_out[col] = reseller_out[col].fillna(0.0).astype(np.float64)
+
+    reseller_out = gpd.GeoDataFrame(reseller_out, geometry="geometry", crs=crs)
+
+    # 5. Build filling_point_clients (In-Memory)
+    filling_44 = filling_gdf.copy()
+    filling_44["id_res&fil"] = pd.to_numeric(filling_44["id_res&fil"], errors="coerce")
+    filling_44 = filling_44[filling_44["id_res&fil"].notna() & (filling_44["id_res&fil"] > 0)].copy()
+    filling_44["id_res&fil"] = filling_44["id_res&fil"].astype("int64")
+
+    filling_base_cols = [c for c in ["id_res&fil", "place_id", "lat", "lon", "geometry"] if c in filling_44.columns]
+    filling_base = filling_44[filling_base_cols].copy()
+    filling_id_set = set(filling_base["id_res&fil"].tolist())
+
+    sell_points = reseller_out.copy()
+    sell_points["id_res&fil"] = pd.to_numeric(sell_points["id_res&fil"], errors="coerce")
+    sell_points = sell_points[sell_points["id_res&fil"].notna() & (sell_points["id_res&fil"] > 0)].copy()
+    sell_points["id_res&fil"] = sell_points["id_res&fil"].astype("int64")
+    
+    for c in client_cols:
+        sell_points[c] = pd.to_numeric(sell_points[c], errors="coerce").fillna(0.0).astype(float)
+
+    marker_col = next((c for c in ["id_filling_only", "id_fillingonly", "id_fillingOnly"] if c in sell_points.columns), None)
+    local_cols = ["id_res&fil"] + client_cols + [c for c in ["place_id", "lat", "lon"] if c in sell_points.columns and c not in ["id_res&fil"] + client_cols]
+    if marker_col and marker_col not in local_cols:
+        local_cols.append(marker_col)
+
+    local_metrics = sell_points[local_cols].drop_duplicates(subset=["id_res&fil"], keep="first")
+    out = filling_base.merge(local_metrics, on="id_res&fil", how="left", suffixes=("", "_sp"))
+    for c in client_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).astype(float)
+
+    if marker_col is None:
+        out["id_filling_only"] = pd.NA
+        marker_col = "id_filling_only"
+
+    resell_44 = resell_gdf.copy()
+    res_assign = resell_44[["id_res&fil", "nearest_filling_points_id"]].copy()
+    res_assign = res_assign.apply(pd.to_numeric, errors="coerce").dropna()
+    res_assign = res_assign[(res_assign > 0).all(axis=1)].astype("int64")
+    res_assign = res_assign[res_assign["nearest_filling_points_id"].isin(filling_id_set)].copy()
+
+    point_clients = sell_points[["id_res&fil", "clients", "clients_max_ideal"]].copy()
+    assigned = res_assign.merge(point_clients, on="id_res&fil", how="left").fillna(0.0)
+
+    agg = (
+        assigned.groupby("nearest_filling_points_id", as_index=False)[["clients", "clients_max_ideal"]]
+        .sum().rename(columns={"nearest_filling_points_id": "id_res&fil", "clients": "assigned_fil_clients", "clients_max_ideal": "assigned_fil_max_ideal_clients"})
+    )
+
+    out = out.merge(agg, on="id_res&fil", how="left").fillna(0.0)
+    out["total_fil_clients"] = out["clients"] + out["assigned_fil_clients"]
+    out["total_max_ideal_clients"] = out["clients_max_ideal"] + out["assigned_fil_max_ideal_clients"]
+
+    keep_cols = [c for c in ["id_res&fil", marker_col, "place_id", "lat", "lon"] + client_cols + ["total_fil_clients", "total_max_ideal_clients", "geometry"] if c in out.columns]
+    out = gpd.GeoDataFrame(out[keep_cols].copy(), geometry="geometry", crs=filling_44.crs)
+
+    return reseller_out, out
+
+def connected_components_8(mask: np.ndarray) -> np.ndarray:
+    """
+    Label 8‑connected components of True cells.
+    Returns an integer array (0 = background).
+    Falls back to pure Python if scipy is not available.
+    """
+    # Try to use scipy first (much faster)
+    try:
+        from scipy import ndimage
+        structure = np.ones((3, 3), dtype=np.uint8)
+        labels, _ = ndimage.label(mask, structure=structure)
+        return labels.astype(np.int32)
+    except ImportError:
+        # Fallback pure Python implementation
+        h, w = mask.shape
+        labels = np.zeros((h, w), dtype=np.int32)
+        current = 0
+        stack = []
+        for r in range(h):
+            for c in range(w):
+                if not mask[r, c] or labels[r, c] != 0:
+                    continue
+                current += 1
+                labels[r, c] = current
+                stack.append((r, c))
+                while stack:
+                    rr, cc = stack.pop()
+                    for dr, dc, _ in NEIGHBORS:
+                        nr, nc = rr + dr, cc + dc
+                        if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                            continue
+                        if not mask[nr, nc] or labels[nr, nc] != 0:
+                            continue
+                        labels[nr, nc] = current
+                        stack.append((nr, nc))
+        return labels
+
+def load_reseller_seeds(
+    gpkg_path: Path,
+    layer: str,
+    id_col: str,
+    attr_col: str,
+    ref_profile: Dict,
+) -> List[Dict]:
+    """
+    Load reseller points, reproject to reference CRS, and keep only those
+    falling inside the raster extent. If multiple points map to the same pixel,
+    keep the most attractive one.
+    Returns a list of dicts with keys: reseller_id, attractiveness, row, col.
+    """
+    gdf = gpd.read_file(gpkg_path, layer=layer)
+    if gdf.empty:
+        raise ValueError("Reseller layer is empty.")
+    ref_crs = ref_profile["crs"]
+    if gdf.crs is None:
+        raise ValueError("Reseller GeoPackage has no CRS.")
+    if gdf.crs != ref_crs:
+        gdf = gdf.to_crs(ref_crs)
+    # Clean IDs and attractiveness
+    ids = pd.to_numeric(gdf[id_col], errors="coerce")
+    attrs = pd.to_numeric(gdf[attr_col], errors="coerce")
+    attrs = attrs.fillna(ATTR_MIN).clip(lower=ATTR_MIN)
+    xs = gdf.geometry.x.to_numpy()
+    ys = gdf.geometry.y.to_numpy()
+    rows, cols = rowcol(ref_profile["transform"], xs, ys)
+    h, w = ref_profile["height"], ref_profile["width"]
+    seeds_dict = {}
+    for rid, attr, r, c in zip(ids, attrs, rows, cols):
+        if not np.isfinite(rid):
+            continue
+        rr = int(r)
+        cc = int(c)
+        if rr < 0 or rr >= h or cc < 0 or cc >= w:
+            continue
+        key = (rr, cc)
+        candidate = {
+            "reseller_id": float(rid),
+            "attractiveness": float(attr),
+            "row": rr,
+            "col": cc,
+        }
+        prev = seeds_dict.get(key)
+        if prev is None or candidate["attractiveness"] > prev["attractiveness"]:
+            seeds_dict[key] = candidate
+    seeds = list(seeds_dict.values())
+    if not seeds:
+        raise ValueError("No reseller seed mapped onto the reference grid.")
+    return seeds
+
+def run_multisource_dijkstra(
+    mode_name: str,
+    friction: np.ndarray,
+    traversable: np.ndarray,
+    target_mask: np.ndarray,
+    labels: np.ndarray,
+    seeds: List[Dict],
+    pixel_size_m: float,
+    log_every: int | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
+    """
+    Multi‑source Dijkstra con Huff‑style scoring (β=2).
+    Returns:
+        best_seed_idx : 2D array of seed indices (or -1)
+        best_time_min : 2D array of travel times in minutes (or inf)
+        best_dist_km  : 2D array of path distance in km (or inf)
+        assigned      : number of target pixels assigned
+        elapsed_sec   : solver wall time
+    """
+    if log_every is None:
+        log_every = LOG_EVERY
+    h, w = friction.shape
+    n_seeds = len(seeds)
+    # Precompute source data
+    seed_rows = np.array([s["row"] for s in seeds], dtype=np.int32)
+    seed_cols = np.array([s["col"] for s in seeds], dtype=np.int32)
+    sqrt_attr = np.array(
+        [math.sqrt(max(s["attractiveness"], ATTR_MIN)) for s in seeds],
+        dtype=np.float64,
+    )
+    # Determine which connected components contain at least one seed
+    seed_labels = labels[seed_rows, seed_cols]
+    max_label = labels.max()
+    has_seed = np.zeros(max_label + 1, dtype=bool)
+    has_seed[seed_labels[seed_labels > 0]] = True
+    # State arrays
+    best_adj = np.full((h, w), np.inf, dtype=np.float64)   # adjusted time
+    best_time = np.full((h, w), np.inf, dtype=np.float64)  # raw time (minutes)
+    best_dist = np.full((h, w), np.inf, dtype=np.float64)  # distance (km)
+    best_seed = np.full((h, w), -1, dtype=np.int32)
+    finalized = np.zeros((h, w), dtype=bool)
+    # Priority queue: (adj_time, row, col, seed_idx)
+    heap = []
+    for si in range(n_seeds):
+        r = seed_rows[si]
+        c = seed_cols[si]
+        if not traversable[r, c]:
+            continue
+        # At source pixel, tie‑break in favour of higher attractiveness
+        if (0.0 < best_adj[r, c]) or (
+            best_adj[r, c] == 0.0
+            and best_seed[r, c] >= 0
+            and sqrt_attr[si] > sqrt_attr[best_seed[r, c]]
+        ):
+            best_adj[r, c] = 0.0
+            best_time[r, c] = 0.0
+            best_dist[r, c] = 0.0
+            best_seed[r, c] = si
+            heapq.heappush(heap, (0.0, r, c, si))
+    total_targets = int(np.count_nonzero(target_mask & traversable))
+    assigned = 0
+    t_start = time.perf_counter()
+    last_log = 0
+    while heap and assigned < total_targets:
+        adj, r, c, si = heapq.heappop(heap)
+        if finalized[r, c]:
+            continue
+        if adj > best_adj[r, c]:
+            continue
+        finalized[r, c] = True
+        if target_mask[r, c]:
+            assigned += 1
+            if assigned - last_log >= log_every:
+                tool._print_progress(
+                    mode_name,
+                    assigned,
+                    total_targets,
+                    time.perf_counter() - t_start,
+                )
+                last_log = assigned
+        inv_scale = 1.0 / sqrt_attr[si]
+        t_curr = best_time[r, c]
+        d_curr = best_dist[r, c]
+        for dr, dc, dist_factor in NEIGHBORS:
+            nr = r + dr
+            nc = c + dc
+            if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                continue
+            if finalized[nr, nc] or not traversable[nr, nc]:
+                continue
+            # Edge cost: average friction × distance (metres) → minutes
+            edge_time = float(
+                0.5 * (friction[r, c] + friction[nr, nc])
+                * (pixel_size_m * dist_factor)
+            )
+            t_new = t_curr + edge_time
+            adj_new = t_new * inv_scale
+            # Distance in km (geometric, independent of friction)
+            edge_km = (pixel_size_m * dist_factor) / 1000.0
+            d_new = d_curr + edge_km
+            # Lexicographic tie‑break: lower adjusted time, then lower raw time
+            if (adj_new + 1e-12) < best_adj[nr, nc] or (
+                abs(adj_new - best_adj[nr, nc]) <= 1e-12
+                and t_new < best_time[nr, nc]
+            ):
+                best_adj[nr, nc] = adj_new
+                best_time[nr, nc] = t_new
+                best_dist[nr, nc] = d_new
+                best_seed[nr, nc] = si
+                heapq.heappush(heap, (adj_new, nr, nc, si))
+    # -------------------------------------------------------------------------
+    # Component‑aware fallback
+    # -------------------------------------------------------------------------
+    unassigned = target_mask & traversable & (best_seed < 0)
+    eligible = unassigned & has_seed[labels]
+    fallback_hits = 0
+    if np.any(eligible):
+        unique_lbls = np.unique(labels[eligible])
+        for lbl in unique_lbls:
+            if lbl <= 0:
+                continue
+            comp_mask = labels == lbl
+            comp_targets = eligible & comp_mask
+            if not np.any(comp_targets):
+                continue
+            comp_seed_idx = np.where(seed_labels == lbl)[0]
+            if comp_seed_idx.size == 0:
+                continue
+            fallback_hits += int(np.count_nonzero(comp_targets))
+            # Reset state inside the component
+            best_adj_comp = np.full((h, w), np.inf, dtype=np.float64)
+            best_time_comp = np.full((h, w), np.inf, dtype=np.float64)
+            best_dist_comp = np.full((h, w), np.inf, dtype=np.float64)
+            best_seed_comp = np.full((h, w), -1, dtype=np.int32)
+            finalized_comp = np.zeros((h, w), dtype=bool)
+            heap_comp = []
+            for si in comp_seed_idx:
+                r0 = seed_rows[si]
+                c0 = seed_cols[si]
+                if not comp_mask[r0, c0] or not traversable[r0, c0]:
+                    continue
+                best_adj_comp[r0, c0] = 0.0
+                best_time_comp[r0, c0] = 0.0
+                best_dist_comp[r0, c0] = 0.0
+                best_seed_comp[r0, c0] = si
+                heapq.heappush(heap_comp, (0.0, r0, c0, si))
+            while heap_comp:
+                adj, r, c, si = heapq.heappop(heap_comp)
+                if finalized_comp[r, c]:
+                    continue
+                if adj > best_adj_comp[r, c]:
+                    continue
+                if not comp_mask[r, c]:
+                    continue
+                finalized_comp[r, c] = True
+                inv_scale = 1.0 / sqrt_attr[si]
+                t_curr = best_time_comp[r, c]
+                d_curr = best_dist_comp[r, c]
+                for dr, dc, dist_factor in NEIGHBORS:
+                    nr = r + dr
+                    nc = c + dc
+                    if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                        continue
+                    if (
+                        finalized_comp[nr, nc]
+                        or not traversable[nr, nc]
+                        or not comp_mask[nr, nc]
+                    ):
+                        continue
+                    edge_time = float(
+                        0.5 * (friction[r, c] + friction[nr, nc])
+                        * (pixel_size_m * dist_factor)
+                    )
+                    t_new = t_curr + edge_time
+                    adj_new = t_new * inv_scale
+                    edge_km = (pixel_size_m * dist_factor) / 1000.0
+                    d_new = d_curr + edge_km
+                    if (adj_new + 1e-12) < best_adj_comp[nr, nc] or (
+                        abs(adj_new - best_adj_comp[nr, nc]) <= 1e-12
+                        and t_new < best_time_comp[nr, nc]
+                    ):
+                        best_adj_comp[nr, nc] = adj_new
+                        best_time_comp[nr, nc] = t_new
+                        best_dist_comp[nr, nc] = d_new
+                        best_seed_comp[nr, nc] = si
+                        heapq.heappush(heap_comp, (adj_new, nr, nc, si))
+            # Merge fallback results into global arrays
+            update = comp_targets & (best_seed_comp >= 0)
+            best_seed[update] = best_seed_comp[update]
+            best_time[update] = best_time_comp[update]
+            best_dist[update] = best_dist_comp[update]
+    elapsed = time.perf_counter() - t_start
+    assigned_final = int(np.count_nonzero(target_mask & traversable & (best_seed >= 0)))
+    tool._print_progress(mode_name, assigned_final, total_targets, elapsed)
+    return best_seed, best_time, best_dist, assigned_final, elapsed
+
+def seeds_to_raster(
+    best_seed_idx: np.ndarray,
+    best_time_min: np.ndarray,
+    best_dist_km: np.ndarray,
+    seeds: List[Dict],
+    inhabited_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert seed indices, times and distances to final rasters."""
+    h, w = best_seed_idx.shape
+    id_raster = np.full((h, w), NODATA, dtype=np.float32)
+    time_raster = np.full((h, w), NODATA, dtype=np.float32)
+    dist_raster = np.full((h, w), NODATA, dtype=np.float32)
+    valid = inhabited_mask & (best_seed_idx >= 0) & np.isfinite(best_time_min)
+    if np.any(valid):
+        seed_ids = np.array([s["reseller_id"] for s in seeds], dtype=np.float64)
+        idx = best_seed_idx[valid]
+        id_raster[valid] = seed_ids[idx].astype(np.float32)
+        time_raster[valid] = best_time_min[valid].astype(np.float32)
+        dist_raster[valid] = best_dist_km[valid].astype(np.float32)
+    return id_raster, time_raster, dist_raster
+
+def recompute_exact_metrics(
+    mode_name: str,
+    friction: np.ndarray,
+    traversable: np.ndarray,
+    id_raster: np.ndarray,                # Phase‑1 assignment (IDs, NODATA elsewhere)
+    phase1_time_raster: np.ndarray,       # approximate times from Phase 1 (for limit)
+    seeds: List[Dict],
+    pixel_size_m: float,
+    time_limit_factor: float | None = None,
+    max_distance_km: float = EXACT_MAX_DISTANCE_KM,
+    log_every: int = 500,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Recompute exact travel times and distances for pixels assigned to each reseller.
+    For every seed, run a single‑source Dijkstra (no finalisation) and record
+    the true metrics only for pixels whose Phase‑1 assignment matches the seed.
+    Early termination:
+        - Stop when all assigned pixels of the current seed have been reached.
+        - Alternatively, stop when the time exceeds `max_phase1_time * time_limit_factor`.
+          If this second condition triggers, a warning is printed.
+    Returns:
+        exact_time_raster : 2D array with exact travel times (minutes, NODATA for unassigned)
+        exact_dist_raster : 2D array with exact distances (km, NODATA for unassigned)
+    """
+    seeds_with_dist_warning = set()
+    seeds_with_time_warning = set()
+    total_target_pixels = 0
+    total_skipped_pixels = 0
+
+    if time_limit_factor is None:
+        time_limit_factor = TIME_LIMIT_FACTOR
+    h, w = friction.shape
+    exact_time = np.full((h, w), NODATA, dtype=np.float32)
+    exact_dist = np.full((h, w), NODATA, dtype=np.float32)
+    # Build mapping from seed ID to its index
+    seed_id_to_idx = {}
+    for si, s in enumerate(seeds):
+        sid = s["reseller_id"]
+        if sid not in seed_id_to_idx:
+            seed_id_to_idx[sid] = si
+    assigned_mask = (id_raster != NODATA) & traversable
+    unique_ids = np.unique(id_raster[assigned_mask])
+    n_seeds_total = len(unique_ids)
+    n_processed = 0
+    t_start = time.perf_counter()
+    last_log = 0
+    print(f"[{mode_name}-exact] Processing {n_seeds_total:,} resellers...")
+    for sid in unique_ids:
+        si = seed_id_to_idx.get(sid)
+        if si is None:
+            continue
+        seed = seeds[si]
+        sr, sc = seed["row"], seed["col"]
+        if not traversable[sr, sc]:
+            continue
+        target_mask = assigned_mask & (id_raster == sid)
+        target_coords = np.argwhere(target_mask)  # list of (r,c)
+        target_count = len(target_coords)
+        total_target_pixels += target_count
+        if target_count == 0:
+            continue
+        # Determine maximum allowed time for early termination
+        phase1_times = phase1_time_raster[target_mask]
+        max_phase1_time = np.max(phase1_times) if len(phase1_times) > 0 else 0.0
+        time_limit = max_phase1_time * time_limit_factor if max_phase1_time > 0 else np.inf
+        # Dijkstra state
+        dist_time = np.full((h, w), np.inf, dtype=np.float64)
+        dist_dist = np.full((h, w), np.inf, dtype=np.float64)
+        visited = np.zeros((h, w), dtype=bool)
+        dist_time[sr, sc] = 0.0
+        dist_dist[sr, sc] = 0.0
+        heap = [(0.0, sr, sc)]
+        reached_targets = 0
+        target_set = set((r, c) for r, c in target_coords)
+        while heap:
+            t, r, c = heapq.heappop(heap)
+            if visited[r, c]:
+                continue
+            visited[r, c] = True
+            # If time limit exceeded (and we haven't reached all targets), stop early
+            if t > time_limit and reached_targets < target_count:
+                if sid not in seeds_with_time_warning:
+                    seeds_with_time_warning.add(sid)
+                break
+            # If this cell is a target for this seed, record exact metrics
+            if (r, c) in target_set:
+                exact_time[r, c] = t
+                exact_dist[r, c] = dist_dist[r, c]
+                reached_targets += 1
+                if reached_targets == target_count:
+                    break  # all done
+            t_curr = t
+            d_curr = dist_dist[r, c]
+            # Distance‑based early termination
+            if d_curr > max_distance_km:
+                if sid not in seeds_with_dist_warning:
+                    seeds_with_dist_warning.add(sid)
+                continue
+            for dr, dc, dist_factor in NEIGHBORS:
+                nr = r + dr
+                nc = c + dc
+                if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                    continue
+                if visited[nr, nc] or not traversable[nr, nc]:
+                    continue
+                edge_time = float(
+                    0.5 * (friction[r, c] + friction[nr, nc])
+                    * (pixel_size_m * dist_factor)
+                )
+                t_new = t_curr + edge_time
+                edge_km = (pixel_size_m * dist_factor) / 1000.0
+                d_new = d_curr + edge_km
+                if t_new < dist_time[nr, nc] - 1e-12:
+                    dist_time[nr, nc] = t_new
+                    dist_dist[nr, nc] = d_new
+                    heapq.heappush(heap, (t_new, nr, nc))
+        # End while heap
+        total_skipped_pixels += (target_count - reached_targets)
+        n_processed += 1
+        if n_processed - last_log >= log_every:
+            elapsed = time.perf_counter() - t_start
+            pct = 100.0 * n_processed / n_seeds_total
+            rate = tool._safe_ratio(n_processed, elapsed)
+            remaining = n_seeds_total - n_processed
+            eta = tool._safe_ratio(remaining, max(rate, 1e-12))
+            print(
+                f"[{mode_name}-exact] {n_processed:,}/{n_seeds_total:,} resellers done "
+                f"({pct:.1f}%) | {rate:.1f} res/s | ETA {eta/60:.1f} min"
+            )
+            last_log = n_processed
+    # End loop over seeds
+    elapsed = time.perf_counter() - t_start
+    # Print warning summary
+    if seeds_with_dist_warning:
+        print(f"  Warning: {len(seeds_with_dist_warning)}/{n_seeds_total} seeds ({100*len(seeds_with_dist_warning)/n_seeds_total:.1f}%) exceeded distance limit {max_distance_km} km")
+    if seeds_with_time_warning:
+        print(f"  Warning: {len(seeds_with_time_warning)}/{n_seeds_total} seeds ({100*len(seeds_with_time_warning)/n_seeds_total:.1f}%) exceeded time limit (factor {time_limit_factor})")
+    if total_target_pixels > 0:
+        skip_pct = 100.0 * total_skipped_pixels / total_target_pixels
+        print(f"  Skipped pixels: {total_skipped_pixels}/{total_target_pixels} ({skip_pct:.1f}%) due to distance or time limits.")
+    print(f"[{mode_name}-exact] All resellers processed. Assigned pixels recomputed.")
+    return exact_time, exact_dist
+
+
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.transform import rowcol
+from typing import Optional, List, Dict
+
+def assign_best(
+    origins: gpd.GeoDataFrame,
+    origin_id_col: str,
+    destinations: Optional[gpd.GeoDataFrame] = None,
+    layer1_name: str = "origin",
+    friction_path: Optional[str] = None,
+    surface_data: Optional[tuple] = None,
+    huff: bool = False,
+    attractiveness_col: Optional[str] = None,
+    output_raster_path: Optional[str] = None,
+    pixel_size_m: Optional[float] = None,
+    pop_mask: Optional[str] = None
+) -> Optional[gpd.GeoDataFrame]:
+    """
+
+    Uses the existing multisource Dijkstra (which internally applies sqrt(attractiveness)
+    scoring when attractiveness differs from 1.0). Exact recomputation is performed
+    only when huff=True.
+    """
+    # 1. Establish Master Reference Profile (forces EPSG:3857 if pop_mask is 3857)
+    ref_profile = None
+    if pop_mask is not None:
+        _, ref_profile, _ = tool._read_raster_base(pop_mask)
+
+    # 2. Build / retrieve cost surface aligned to reference
+    if surface_data is None:
+        if friction_path is None:
+            raise ValueError("Either surface_data or friction_path must be provided")
+        surface_data = build_surface(friction_path, ref_profile=ref_profile)
+        
+    cost_layer, transform, geod, crs_obj = surface_data
+
+    # 3. Dynamically calculate pixel size from transform if not provided
+    if pixel_size_m is None:
+        pixel_size_m = abs(transform[0])
+
+    if huff:
+        if attractiveness_col is None:
+            raise ValueError("attractiveness_col is required when huff=True")
+        if attractiveness_col not in origins.columns:
+            raise ValueError(f"Column '{attractiveness_col}' not in origins")
+
+    if destinations is None and output_raster_path is None:
+        raise ValueError("At least one of 'destinations' or 'output_raster_path' must be given")
+
+    # 2. Reproject to raster CRS
+    origins_proj = origins.to_crs(crs_obj)
+    dests_proj = None
+    if destinations is not None:
+        dests_proj = destinations.to_crs(crs_obj)
+
+    # 3. Traversable mask (valid friction cells)
+    traversable = np.isfinite(cost_layer) & (cost_layer > 0.0)
+    target_mask = np.zeros_like(traversable, dtype=bool)
+
+    def _pixel_coords(gdf):
+        rows, cols = [], []
+        for geom in gdf.geometry:
+            if geom.is_empty:
+                rows.append(-1); cols.append(-1)
+            else:
+                r, c = rowcol(transform, geom.x, geom.y)
+                rows.append(r); cols.append(c)
+        return np.array(rows, dtype=np.int32), np.array(cols, dtype=np.int32)
+
+    o_rows, o_cols = _pixel_coords(origins_proj)
+    o_valid = traversable[o_rows, o_cols] & (o_rows >= 0)
+    o_rows = o_rows[o_valid]; o_cols = o_cols[o_valid]
+    o_ids = origins_proj[origin_id_col].iloc[o_valid].to_numpy()
+
+    if huff:
+        o_attr = origins_proj[attractiveness_col].iloc[o_valid].to_numpy(dtype=float)
+    else:
+        o_attr = np.ones(len(o_rows), dtype=float)
+
+    d_rows = d_cols = None
+    dest_indices_valid = np.array([], dtype=int)
+    if dests_proj is not None:
+        d_rows, d_cols = _pixel_coords(dests_proj)
+        d_valid = traversable[d_rows, d_cols] & (d_rows >= 0)
+        d_rows = d_rows[d_valid]; d_cols = d_cols[d_valid]
+        dest_indices_valid = np.where(d_valid)[0]
+        target_mask[d_rows, d_cols] = True
+
+    if output_raster_path is not None and pop_mask is not None:
+        pop_aligned = np.zeros_like(cost_layer, dtype=np.float32)
+        with rasterio.open(pop_mask) as src:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=pop_aligned,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=crs_obj,
+                resampling=Resampling.nearest
+            )
+        target_mask = target_mask | (traversable & (pop_aligned > 0))
+    elif output_raster_path is not None:
+        target_mask = traversable
+
+    if len(o_rows) == 0:
+        if dests_proj is not None:
+            result = destinations.copy()
+            result[f"nearest_{layer1_name}_id"] = None
+            result[f"nearest_{layer1_name}_time"] = np.nan
+            result[f"nearest_{layer1_name}_distance"] = np.nan
+            return result
+        return None
+
+    # 4. Build seeds
+    seeds: List[Dict] = []
+    for i in range(len(o_rows)):
+        seeds.append({
+            "reseller_id": o_ids[i],
+            "attractiveness": float(o_attr[i]),
+            "row": int(o_rows[i]),
+            "col": int(o_cols[i]),
+        })
+
+    # 5. Connected components (required by Dijkstra)
+    labels = connected_components_8(traversable)
+
+    mode_label = layer1_name or "assign"
+
+    # 6. Run multisource Dijkstra (the original, with Huff scoring built in)
+    best_seed_idx, best_time_approx, best_dist_approx, _, _ = run_multisource_dijkstra(
+        mode_name=mode_label,
+        friction=cost_layer,
+        traversable=traversable,
+        target_mask=target_mask,   
+        labels=labels,
+        seeds=seeds,
+        pixel_size_m=pixel_size_m,
+        log_every=250000,
+    )
+
+    # 7. Exact recomputation (only for Huff)
+    if huff:
+        id_raster = np.full(cost_layer.shape, -1, dtype=np.int32)
+        for i, seed in enumerate(seeds):
+            id_raster[best_seed_idx == i] = seed["reseller_id"]
+        time_exact, dist_exact = recompute_exact_metrics(
+            mode_name=mode_label,
+            friction=cost_layer,
+            traversable=traversable,
+            id_raster=id_raster,
+            phase1_time_raster=best_time_approx,
+            seeds=seeds,
+            pixel_size_m=pixel_size_m,
+            log_every=500,
+        )
+        best_time = time_exact
+        best_dist = dist_exact
+    else:
+        best_time = best_time_approx
+        best_dist = best_dist_approx
+
+    # 8. Vector output
+    result_gdf = None
+    if dests_proj is not None:
+        result_gdf = destinations.copy()
+        id_col = f"nearest_{layer1_name}_id"
+        time_col = f"nearest_{layer1_name}_time"
+        dist_col = f"nearest_{layer1_name}_distance"
+        result_gdf[id_col] = None
+        result_gdf[time_col] = np.nan
+        result_gdf[dist_col] = np.nan
+
+        for i, dest_idx in enumerate(dest_indices_valid):
+            r, c = d_rows[i], d_cols[i]
+            sidx = best_seed_idx[r, c]
+            if sidx < 0:
+                continue
+            seed = seeds[sidx]
+            t_val = best_time[r, c]
+            d_val = best_dist[r, c]
+            result_gdf.at[result_gdf.index[dest_idx], id_col] = seed["reseller_id"]
+            if np.isfinite(t_val):
+                result_gdf.at[result_gdf.index[dest_idx], time_col] = float(t_val)
+            if np.isfinite(d_val):
+                result_gdf.at[result_gdf.index[dest_idx], dist_col] = float(d_val)
+
+    # 9. Raster output
+    if output_raster_path is not None:
+        out_id = np.full(cost_layer.shape, -9999, dtype=np.int32)
+        out_time = np.full(cost_layer.shape, -9999.0, dtype=np.float32)
+        out_dist = np.full(cost_layer.shape, -9999.0, dtype=np.float32)
+
+        for i, seed in enumerate(seeds):
+            mask = (best_seed_idx == i) & target_mask
+            out_id[mask] = seed["reseller_id"]
+            out_time[mask] = best_time[mask]
+            out_dist[mask] = best_dist[mask]
+
+        if friction_path:
+            with rasterio.open(friction_path) as src:
+                out_meta = src.meta.copy()
+        else:
+            out_meta = {
+                "driver": "GTiff",
+                "height": cost_layer.shape[0],
+                "width": cost_layer.shape[1],
+                "count": 3,
+                "dtype": "float32",
+                "crs": crs_obj,
+                "transform": transform,
+                "nodata": -9999.0,
+            }
+        out_meta.update(driver="GTiff", count=3, nodata=-9999.0)
+        band_names = [
+            f"nearest_{layer1_name}_id",
+            f"nearest_{layer1_name}_time",
+            f"nearest_{layer1_name}_distance",
+        ]
+        with rasterio.open(output_raster_path, "w", **out_meta) as dst:
+            dst.write(out_id, 1)
+            dst.write(out_time.astype(np.float32), 2)
+            dst.write(out_dist.astype(np.float32), 3)
+            dst.descriptions = band_names
+
+    return result_gdf
