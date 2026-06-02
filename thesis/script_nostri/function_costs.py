@@ -44,6 +44,8 @@ import function_allocation as alloc
 import function_process as process
 from dataclasses import dataclass
 
+# Francesco part
+
 def ports(gdf, import_cost_df):
     """
     Calculates extra costs (Import, STS, Pre-bottling) and updates final price.
@@ -127,14 +129,7 @@ def crf(rate: float, years: int) -> float:
     """
     return (rate * (1.0 + rate) ** years) / ((1.0 + rate) ** years - 1.0)
 
-
-# Calculate fixed cost inputs used by the cost per kg functions.
-# This makes the downstream functions depend only on distance/time.
-
-
-driver_hourly_cost_usd = (
-    driver_annual_salary_usd * salary_multiplier / (hours_per_day * days_per_year)
-)
+driver_hourly_cost_usd = (driver_annual_salary_usd * salary_multiplier) / (hours_per_day * days_per_year)
 
 def single_travel_fixed(avg_one_way_dist_km: float, vehicle: Vehicle) -> float:
     """
@@ -311,127 +306,6 @@ def average_transport_distance(points_dict):
     print(f"✓ Average transport distance (allocation-weighted): {avg_distance:.2f} km")
     
     return avg_distance
-
-
-def transport_to_storage(points_dict, vehicle: Vehicle):  # TODO delete if replaced by trasport()
-    """
-    Calculate transport cost from each facility to its assigned storage.
-    
-    This function computes the cost_transport_to_storage for all facility types
-    (refineries, ports, gas_plants, border_points) based on their distance and 
-    travel time to assigned storage facilities.
-    """
-    facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
-    
-    # calculate avg_one_way_dist_km 
-    avg_one_way_dist_km = average_transport_distance(points_dict)
-
-    # Validate avg_one_way_dist_km
-    if not np.isfinite(avg_one_way_dist_km) or avg_one_way_dist_km <= 0:
-        print(f"⚠ Warning: Invalid avg_one_way_dist_km = {avg_one_way_dist_km}. All costs set to NaN")
-        for key in facility_keys:
-            gdf = points_dict.get(key)
-            if gdf is not None:
-                gdf['cost_transport_to_storage'] = np.nan
-                points_dict[key] = gdf
-        return points_dict
-    
-    # Calculate transport cost for each facility
-    for key in facility_keys:
-        gdf = points_dict.get(key)
-        if gdf is None:
-            continue
-        
-        # Check for required columns
-        if 'tank_distance' not in gdf.columns or 'tank_traveltime' not in gdf.columns:
-            gdf['cost_transport_to_storage'] = np.nan
-            points_dict[key] = gdf
-            continue
-        
-        # Extract distance and time arrays
-        d_km = pd.to_numeric(gdf['tank_distance'], errors='coerce').to_numpy(dtype=float)
-        t_min = pd.to_numeric(gdf['tank_traveltime'], errors='coerce').to_numpy(dtype=float)
-        out_cost = np.full(len(gdf), np.nan, dtype=float)
-        
-        # Identify valid rows (all values are finite and positive)
-        valid = np.isfinite(d_km) & (d_km > 0) & np.isfinite(t_min) & (t_min >= 0)
-        valid_idx = np.where(valid)[0]
-        
-        # Compute tanker cost for each valid row
-        for i in valid_idx:
-            out_cost[i] = single_travel(
-                one_way_distance_km=float(d_km[i]),
-                one_way_time_min=float(t_min[i]),
-                avg_one_way_dist_km=avg_one_way_dist_km,
-                vehicle=vehicle
-            )['total_cost_per_kg']
-        
-        gdf['cost_transport_to_storage'] = out_cost
-        points_dict[key] = gdf
-    
-    return points_dict
-
-
-def aggregate_transport_costs_to_storage(points_dict):   # TODO replace if transport() is used
-    """
-    Aggregate facility-level transport costs to primary storage using weighted average.
-    
-    This function collects cost_transport_to_storage from all facility types,
-    applies a weighted average by facility percentage, and merges results back
-    to the primary_storage GeoDataFrame.
-   
-    """
-    facility_keys = ["refineries", "ports", "gas_plants", "border_points"]
-    
-    # Initialize primary storage
-    primary_storage = points_dict["primary_storage"].copy()
-    if 'name' not in primary_storage.columns:
-        primary_storage['name'] = [f'primary_storage_{i}' for i in range(len(primary_storage))]
-    
-    # Gather facility data
-    weighted_df = pd.concat([
-        points_dict[k][['tank_name', 'cost_transport_to_storage', 'percentage']]
-        for k in facility_keys if points_dict.get(k) is not None
-    ], ignore_index=True)
-    
-    # Conversions and filtering
-    weighted_df = weighted_df.assign(
-        cost_transport_to_storage=lambda x: pd.to_numeric(x['cost_transport_to_storage'], errors='coerce'),
-        percentage=lambda x: pd.to_numeric(x['percentage'], errors='coerce').fillna(0)
-    ).dropna(subset=['cost_transport_to_storage'])
-    weighted_df = weighted_df[weighted_df['percentage'] > 0]
-    
-    # Calculate weighted average
-    if len(weighted_df) > 0:
-        weighted_df = weighted_df.assign(
-            weighted=lambda x: x['cost_transport_to_storage'] * x['percentage']
-        )
-        
-        agg = weighted_df.groupby('tank_name', as_index=False).agg(
-            weighted_cost_sum=('weighted', 'sum'),
-            weight_sum=('percentage', 'sum')
-        )
-        
-        agg['cost_transport_to_storage'] = agg['weighted_cost_sum'] / agg['weight_sum']
-        
-        # Merge back to primary storage
-        primary_storage = primary_storage.merge(
-            agg[['tank_name', 'cost_transport_to_storage']], 
-            left_on='name', 
-            right_on='tank_name', 
-            how='left'
-        ).drop('tank_name', errors='ignore')
-    else:
-        primary_storage['cost_transport_to_storage'] = np.nan
-    
-    # Update points dict
-    points_dict['primary_storage'] = primary_storage
-    return points_dict
-
-from typing import Union, Optional
-import numpy as np
-import pandas as pd
-import geopandas as gpd
 
 def transport(
     layer1: gpd.GeoDataFrame,
@@ -734,9 +608,8 @@ def total(gdf: gpd.GeoDataFrame, output_col: str = 'cost_total') -> gpd.GeoDataF
     df[output_col] = df[cost_cols].fillna(0).sum(axis=1)
     return df
 
+# Mattia part
 
-#new part mattia
-# move to cost.py
 def filling(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Calculates the internal operating costs of the filling plant and adds it as 'cost_fil_plants'.
@@ -872,7 +745,6 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
     
     return resell
 
-
 def _compute_spatial_vot(income_array: np.ndarray) -> np.ndarray:
     """Computes the spatial Value of Time (VOT) based on local income."""
     valid = np.isfinite(income_array)
@@ -896,7 +768,6 @@ def _compute_spatial_vot(income_array: np.ndarray) -> np.ndarray:
     vot[valid] = vot_valid[valid].astype(np.float32)
     
     return vot
-
 
 def _build_cost_maps(points: dict):
     """Builds reference cost dictionaries directly from the current in-memory points layer."""
@@ -934,8 +805,6 @@ def _map_effective_cost(ids_int: np.ndarray, map_resell: dict, map_fill: dict) -
     out[valid] = mapped[inv]
     
     return out
-
-
 
 def end_user(points: dict, huff_raster_path: str|Path, income_raster_path: str|Path, 
              pop_raster_path: str|Path,urban_raster_path: str|Path,  lpg_share_path: str|Path, output_path: str|Path, 

@@ -124,125 +124,6 @@ def calculate_mcp_routes(origin_row, origin_col, dest_rows, dest_cols, cost_laye
                     
     return times_min, distances_km
 
-
-def assign_nearest_storage_by_traveltime(facilities_gdf, storage_gdf, friction_path=None, surface_data=None):   # TODO remove if replaced by assign_nearest
-    """
-    Assign nearest storage by least-time path and compute route distance.
-    Adds storage id/name, travel time (minutes), and route distance (km).
-    Uses the friction raster cost surface for routing.
-    Returns a GeoDataFrame in the original CRS.
-    """
-    facilities = facilities_gdf.copy()
-
-    if facilities.empty:
-        facilities['tank_fid'] = pd.Series(dtype='object')
-        facilities['tank_name'] = pd.Series(dtype='object')
-        facilities['tank_distance'] = pd.Series(dtype='float64')
-        facilities['tank_traveltime'] = pd.Series(dtype='float64')
-        return facilities
-
-    if storage_gdf is None or storage_gdf.empty:
-        facilities['tank_fid'] = None
-        facilities['tank_name'] = None
-        facilities['tank_distance'] = np.nan
-        facilities['tank_traveltime'] = np.nan
-        return facilities
-
-    # Build cost surface and get projection info once
-    if surface_data is not None:
-        cost_layer, transform, geod, friction_crs = surface_data
-    else:
-        friction_file = Path(friction_path)
-        if not friction_file.exists():
-            raise FileNotFoundError(f"Missing friction raster: {friction_file}")
-        cost_layer, transform, geod, friction_crs = build_surface(friction_file)
-
-    if friction_crs is None:
-        raise ValueError("Friction raster has no CRS in metadata")
-
-    facilities_tt = facilities.to_crs(friction_crs).copy()
-    storage_tt = storage_gdf.to_crs(friction_crs).copy().reset_index(drop=True)
-
-    # Build a guaranteed unique tank identifier
-    fid_col = next((col for col in ['FID', 'fid', 'id', 'id_res&fil'] if col in storage_tt.columns), None)
-
-    storage_tt['__tank_fid'] = storage_tt.index.astype(str)
-    if fid_col is not None:
-        fid_vals = storage_tt[fid_col].astype(str)
-        invalid = fid_vals.str.strip().isin(['', 'nan', 'None'])
-        duplicated = fid_vals.duplicated(keep=False)
-        use_col = (~invalid) & (~duplicated)
-        storage_tt.loc[use_col, '__tank_fid'] = fid_vals.loc[use_col]
-
-    name_col = next((col for col in storage_tt.columns if str(col).lower() == 'name'), None)
-    if name_col is None:
-        storage_tt['__tank_name'] = [f'primary_storage_{i}' for i in storage_tt.index]
-        name_col = '__tank_name'
-    else:
-        storage_tt[name_col] = storage_tt[name_col].astype(str)
-        missing_names = storage_tt[name_col].str.strip().isin(['', 'nan', 'None'])
-        storage_tt.loc[missing_names, name_col] = [f'primary_storage_{i}' for i in storage_tt.index[missing_names]]
-
-    facility_points = facilities_tt.geometry
-    if not facilities_tt.geom_type.eq('Point').all():
-        facility_points = facilities_tt.geometry.centroid
-
-    storage_points = storage_tt.geometry
-    if not storage_tt.geom_type.eq('Point').all():
-        storage_points = storage_tt.geometry.centroid
-
-    # Precompute raster indices for facilities and tanks once
-    fac_rows, fac_cols = [], []
-    for geom in facility_points:
-        row, col = rasterio.transform.rowcol(transform, geom.x, geom.y)
-        fac_rows.append(row)
-        fac_cols.append(col)
-
-    tank_rows, tank_cols = [], []
-    for geom in storage_points:
-        row, col = rasterio.transform.rowcol(transform, geom.x, geom.y)
-        tank_rows.append(row)
-        tank_cols.append(col)
-
-    travel_matrix = np.full((len(facilities_tt), len(storage_tt)), np.nan, dtype=np.float64)
-    distance_matrix = np.full((len(facilities_tt), len(storage_tt)), np.nan, dtype=np.float64)
-
-    # Compute routes from each tank to all facilities
-    for tank_idx, (t_row, t_col) in enumerate(zip(tank_rows, tank_cols)):
-        t_times, t_dists = calculate_mcp_routes(
-            t_row, t_col, fac_rows, fac_cols, cost_layer, transform, geod
-        )
-        travel_matrix[:, tank_idx] = t_times
-        distance_matrix[:, tank_idx] = t_dists
-
-    # Assign nearest storage based on travel time
-    tank_id_supply = np.array([None] * len(facilities_tt), dtype=object)
-    tank_name = np.array([None] * len(facilities_tt), dtype=object)
-    tank_distance = np.full(len(facilities_tt), np.nan, dtype=np.float64)
-    tank_traveltime = np.full(len(facilities_tt), np.nan, dtype=np.float64)
-
-    valid = np.any(np.isfinite(travel_matrix), axis=1)
-    if np.any(valid):
-        best_tank_idx = np.nanargmin(travel_matrix[valid], axis=1)
-        valid_rows = np.where(valid)[0]
-
-        storage_ids = storage_tt['id_supply'].astype(str).to_numpy()
-        storage_names = storage_tt[name_col].astype(str).to_numpy()
-        
-        tank_id_supply[valid] = storage_ids[best_tank_idx]
-        tank_name[valid] = storage_names[best_tank_idx]
-
-        tank_traveltime[valid] = travel_matrix[valid_rows, best_tank_idx]
-
-        tank_distance[valid] = distance_matrix[valid_rows, best_tank_idx]
-
-    facilities['tank_id_supply'] = tank_id_supply
-    facilities['tank_name'] = tank_name
-    facilities['tank_distance'] = tank_distance
-    facilities['tank_traveltime'] = tank_traveltime
-    
-    return facilities
-
 def assign_nearest(
     layer1: gpd.GeoDataFrame,
     layer2: gpd.GeoDataFrame,
@@ -359,153 +240,190 @@ def assign_nearest(
     
     return result
 
-def calculate_percentages_supply(refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df):
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+
+def calculate_percentages_supply(
+    refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df,
+    refineries_cols='crude_capacity', 
+    ports_cols='LPG_capacity', 
+    gas_plants_cols='LPG_prod', 
+    border_points_cols=None
+    ):
     """
     Calculate facility-level market shares from national shares and capacities.
-    Uses capacity-based weights for refineries, ports, and gas plants.
-    Keeps border point percentages computed earlier.
-    Returns a combined GeoDataFrame and a per-category dict.
+    Accepts single strings or lists of strings for the weight columns.
+    Averages the calculated percentages across multiple columns and rescales.
     """
-
-    # Choose a common CRS for all facility layers before concatenation
     target_crs = refineries_gdf.crs or ports_gdf.crs or gas_plants_gdf.crs or border_points_gdf.crs
 
-    # For refineries, use crude_capacity for proportional split
-    refineries_weight_col = 'crude_capacity'
-
-    def _numeric_series_or_zero(gdf, col):
-        if col in gdf.columns:
-            return pd.to_numeric(gdf[col], errors='coerce').fillna(0.0)
-        return pd.Series(0.0, index=gdf.index, dtype='float64')
-
-    # Calculate totals
-    totals = {
-        'refineries': _numeric_series_or_zero(refineries_gdf, refineries_weight_col).sum(),
-        'ports': _numeric_series_or_zero(ports_gdf, 'LPG_capacity').sum(),
-        'gas_plants': _numeric_series_or_zero(gas_plants_gdf, 'LPG_prod').sum(),
+    specs = {
+        'refineries': (refineries_gdf, refineries_cols),
+        'ports': (ports_gdf, ports_cols),
+        'gas_plants': (gas_plants_gdf, gas_plants_cols),
+        'border_points': (border_points_gdf, border_points_cols) 
     }
-
-    # Get national shares from raster-derived values (no fallback defaults)
-    nat_shares = {
-        'refineries': nat_shares_df.loc['refineries'].iloc[0] / 100,
-        'ports': nat_shares_df.loc['ports'].iloc[0] / 100,
-        'gas_plants': nat_shares_df.loc['gas_plants'].iloc[0] / 100,
-        'border_points': nat_shares_df.loc['border_points'].iloc[0] / 100,
-    }
-
-    print(f"Shares: {nat_shares}")
 
     by_category = {}
-    specs = [
-        ('refineries', refineries_gdf, refineries_weight_col),
-        ('ports', ports_gdf, 'LPG_capacity'),
-        ('gas_plants', gas_plants_gdf, 'LPG_prod'),
-    ]
 
-    for src_name, src_gdf, weight_col in specs:
+    for category, (src_gdf, weight_cols) in specs.items():
         gdf = src_gdf.copy()
 
-        # Reproject each layer to a common CRS to avoid concat CRS conflicts
-        if target_crs is not None and gdf.crs is not None and gdf.crs != target_crs:
+        if target_crs and gdf.crs and gdf.crs != target_crs:
             gdf = gdf.to_crs(target_crs)
 
-        # Ensure required columns used later in the pipeline are present
         if 'name' not in gdf.columns:
-            gdf['name'] = [f'{src_name}_{idx}' for idx in gdf.index]
-
-        if 'cost_source' not in gdf.columns:
-            gdf['cost_source'] = np.nan
-        else:
+            gdf['name'] = f"{category}_" + gdf.index.astype(str)
+            
+        if 'cost_source' in gdf.columns:
             gdf['cost_source'] = pd.to_numeric(gdf['cost_source'], errors='coerce')
-
-        if 'country' not in gdf.columns:
-            gdf['country'] = 'Unknown'
         else:
+            gdf['cost_source'] = np.nan
+        
+        if 'country' in gdf.columns:
             gdf['country'] = gdf['country'].fillna('Unknown')
-
-        # Keep category in each layer and compute percentage
-        gdf['category'] = src_name if src_name != 'gas_plants' else 'gasplants'
-
-        weights = _numeric_series_or_zero(gdf, weight_col)
-
-        if totals[src_name] > 0:
-            gdf['percentage'] = nat_shares[src_name] * (weights / totals[src_name])
         else:
-            gdf['percentage'] = 0.0
+            gdf['country'] = 'Unknown'
 
-        by_category[src_name] = gdf
+        gdf['category'] = 'gasplants' if category == 'gas_plants' else category
 
-    # Border points: keep precomputed percentages from processing step
-    border = border_points_gdf.copy()
-    if target_crs is not None and border.crs is not None and border.crs != target_crs:
-        border = border.to_crs(target_crs)
+        if weight_cols:
+            # Ensure weight_cols is a list for iteration
+            if isinstance(weight_cols, str):
+                weight_cols = [weight_cols]
 
-    if 'name' not in border.columns:
-        border['name'] = [f'border_points_{idx}' for idx in border.index]
+            avg_shares = pd.Series(0.0, index=gdf.index, dtype='float64')
+            valid_cols_count = 0
 
-    if 'cost_source' not in border.columns:
-        border['cost_source'] = np.nan
-    else:
-        border['cost_source'] = pd.to_numeric(border['cost_source'], errors='coerce')
+            for col in weight_cols:
+                if col in gdf.columns:
+                    weights = pd.to_numeric(gdf[col], errors='coerce').fillna(0.0)
+                    total_weight = weights.sum()
+                    
+                    if total_weight > 0:
+                        # Calculate the fractional share for this specific column and add to total
+                        avg_shares += (weights / total_weight)
+                        valid_cols_count += 1
 
-    if 'country' not in border.columns:
-        border['country'] = 'Unknown'
-    else:
-        border['country'] = border['country'].fillna('Unknown')
+            # Average the shares across all provided valid columns
+            if valid_cols_count > 0:
+                avg_shares = avg_shares / valid_cols_count
 
-    border['category'] = 'border_points'
-    if 'percentage' not in border.columns:
-        border['percentage'] = 0.0
-    else:
-        border['percentage'] = pd.to_numeric(border['percentage'], errors='coerce').fillna(0.0)
+            # Scale by the national share
+            nat_share = nat_shares_df.loc[category].iloc[0] / 100.0
+            gdf['percentage'] = avg_shares * nat_share
+            
+        else:
+            if 'percentage' in gdf.columns:
+                gdf['percentage'] = pd.to_numeric(gdf['percentage'], errors='coerce').fillna(0.0)
+            else:
+                gdf['percentage'] = 0.0
 
-    by_category['border_points'] = border
+        by_category[category] = gdf
 
-    result = gpd.GeoDataFrame(
-        pd.concat(
-            [
-                by_category['refineries'],
-                by_category['ports'],
-                by_category['gas_plants'],
-                by_category['border_points'],
-            ],
-            ignore_index=True,
-        ),
-        crs=target_crs,
-    )
+    result = gpd.GeoDataFrame(pd.concat(list(by_category.values()), ignore_index=True), crs=target_crs)
 
-    print(f"✓ {len(result)} sources calculated | Total share: {result['percentage'].sum():.2%}")
+    print(f"Check: {len(result)} sources calculated | Total share: {result['percentage'].sum():.2%}")
     return result, by_category
 
-def calculate_percentages_filling(filling_gdf):
+
+def calculate_percentages_filling(filling_gdf, filling_cols=None):
     """
-    Calculate demand-based percentage shares for filling points.
-    Searches for demand columns in priority order: percentage_demand, total_fil_clients, clients.
-    If found column represents counts, converts to percentage share of total demand.
-    Adds 'percentage_demand' column to the GeoDataFrame.
+    Calculate demand-based percentage shares for filling points using one or multiple columns.
+    Averages the proportional shares across columns and normalizes the final result.
     """
     filling = filling_gdf.copy()
-    
-    # Determine the column to use for demand (priority: percentage, then client counts)
-    demand_col = next((c for c in ["percentage_demand", "total_fil_clients", "clients"] if c in filling.columns), None)
 
-    if demand_col:
-        demand_vals = pd.to_numeric(filling[demand_col], errors="coerce").fillna(0.0)
+    if filling_cols is None:
+        priority_cols = ["percentage_demand", "total_fil_clients", "clients"]
+        found_col = next((c for c in priority_cols if c in filling.columns), None)
+        if not found_col:
+            raise ValueError(
+                "No valid demand-related column found. Looked for: "
+                "percentage_demand, total_fil_clients, or clients"
+            )
+        filling_cols = [found_col]
+
+    # Ensure filling_cols is a list
+    if isinstance(filling_cols, str):
+        filling_cols = [filling_cols]
+
+    missing_cols = [c for c in filling_cols if c not in filling.columns]
+    if missing_cols:
+        raise ValueError(f"Columns not found in GeoDataFrame: {missing_cols}")
+
+    avg_shares = pd.Series(0.0, index=filling.index, dtype='float64')
+    valid_cols_count = 0
+
+    for col in filling_cols:
+        demand_vals = pd.to_numeric(filling[col], errors="coerce").fillna(0.0)
+        total_demand = demand_vals.sum()
+
+        if total_demand > 0:
+            if col == "percentage_demand":
+                # Assume percentage_demand is already a 0-1 fraction
+                avg_shares += demand_vals
+            else:
+                # Convert raw counts to a 0-1 fraction
+                avg_shares += (demand_vals / total_demand)
+            valid_cols_count += 1
+
+    if valid_cols_count > 0:
+        # Average the fractions and apply a final normalization to ensure the sum is exactly 1.0
+        averaged = avg_shares / valid_cols_count
+        final_total = averaged.sum()
         
-        # If the column represents raw counts (clients), convert to a percentage share of total demand
-        if demand_col != "percentage_demand":
-            total_demand = demand_vals.sum()
-            filling["percentage_demand"] = (demand_vals / total_demand) if total_demand > 0 else 0.0
+        if final_total > 0:
+            filling["percentage_demand"] = averaged / final_total
         else:
-            filling["percentage_demand"] = demand_vals
-            
-        print(f"✓ Demand shares calculated using column: {demand_col}")
-        return filling
+            filling["percentage_demand"] = 0.0
     else:
-        raise ValueError("No demand-related column found in filling_gdf (expected: percentage_demand, total_fil_clients, or clients)")
+        filling["percentage_demand"] = 0.0
+
+    print(f"Check: Demand shares calculated using columns: {filling_cols}")
+    return filling
+
+def calculate_percentages(
+    step, 
+    refineries_gdf=None, 
+    ports_gdf=None, 
+    gas_plants_gdf=None, 
+    border_points_gdf=None, 
+    filling_points_gdf=None, 
+    nat_shares_df=None,
+    **kwargs
+    ):
+    """
+    Wrapper function to calculate percentages for both supply and filling stages.
+    Accepts optional column names/dictionaries via **kwargs to override default weight columns.
+    
+    Optional kwargs for 'supply': refineries_cols, ports_cols, gas_plants_cols, border_points_cols
+    Optional kwargs for 'filling': filling_cols
+    """
+    if step == "supply":
+        # Filter kwargs to only include those accepted by the updated supply function
+        supply_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k in ['refineries_cols', 'ports_cols', 'gas_plants_cols', 'border_points_cols']
+        }
+        return calculate_percentages_supply(
+            refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf, nat_shares_df, **supply_kwargs
+        )
+        
+    elif step == "filling":
+        # Filter kwargs to only include those accepted by the updated filling function
+        filling_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k == 'filling_cols'
+        }
+        return calculate_percentages_filling(filling_points_gdf, **filling_kwargs)
+        
+    else:
+        raise ValueError("Invalid step specified. Use 'supply' or 'filling'.")
 
 
-def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf): # TODO remove if replaced by aggregate_to_storage
+def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf): 
     """
     Aggregate supply percentages from all sources (refineries, ports, gas plants, border points)
     to primary storage facilities at the storage level.
@@ -538,10 +456,11 @@ def aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, 
     ps["percentage_supply"] = ps["id_supply"].map(supply_sum).fillna(0.0)
     
     print(f"✓ Supply aggregated to {len(ps)} storage facilities | Total supply: {ps['percentage_supply'].sum():.4f}")
+    
     return ps
 
 
-def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):  # TODO remove if replaced by aggregate_to_storage
+def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf): 
     """
     Aggregate filling percentages from all filling points to primary storage facilities
     at the storage level.
@@ -558,6 +477,26 @@ def aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf):  # TO
     ps["percentage_demand"] = ps["id_supply"].map(filling_sum).fillna(0.0)
     
     print(f"✓ Filling aggregated to {len(ps)} storage facilities | Total filling: {ps['percentage_demand'].sum():.4f}")
+
+    return ps
+
+def aggregate_to_storage(stage: str,
+                        primary_storage_gdf, 
+                         refineries_gdf = None, 
+                         ports_gdf = None, 
+                         gas_plants_gdf = None, 
+                         border_points_gdf = None, 
+                         filling_points_gdf = None):
+    """
+    apply aggregation to storage for both supply and filling, depending on the stage of the process.
+    """
+    if stage == "supply":
+        ps = aggregate_supply_to_storage(primary_storage_gdf, refineries_gdf, ports_gdf, gas_plants_gdf, border_points_gdf)
+    elif stage == "filling":
+        ps = aggregate_filling_to_storage(primary_storage_gdf, filling_points_gdf)
+    else:
+        raise ValueError("Invalid stage specified. Use 'supply' or 'filling'.")
+    
     return ps
 
 
@@ -650,7 +589,6 @@ def optimize_storage_allocation(primary_storage_gdf, travel_time_matrix):
     
     return allocation_matrix, result
 
-
 def write_allocation_excel(primary_storage_gdf, travel_time_matrix, distance_matrix, allocation_matrix, output_path):
     """
     Write storage allocation results to Excel workbook with three sheets.
@@ -688,7 +626,6 @@ def write_allocation_excel(primary_storage_gdf, travel_time_matrix, distance_mat
     print(f"✓ Saved: {output_path}")
     
     return Path(output_path)
-
 
 def allocation_process(primary_storage_gdf, friction_path, output_excel_path):
     """
@@ -740,9 +677,7 @@ def allocation_process(primary_storage_gdf, friction_path, output_excel_path):
         'total_demand': total_demand,
     }
 
-
-#new mattia part
-#function_allocation.py
+# Mattia part
 
 import numpy as np
 import pandas as pd

@@ -43,6 +43,8 @@ import function_costs as cost
 import function_allocation as alloc
 from dataclasses import dataclass
 
+# Francesco part
+
 def fill_from_buffer(gdf, default_gdf, cols, buffer_km=BUFFER_KM):
     """
     Fill missing values by searching nearby features within a buffer radius.
@@ -189,7 +191,7 @@ def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     return gdf
 
 
-def gas_plants(gdf, default_gdf, lpg_price_raster_path, price_band=1):
+def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1):
     """
     Fill missing values and add LPG price from raster sampling.
     Normalizes LPG production to numeric values.
@@ -217,7 +219,7 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     return gdf
 
 
-def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, only_phase4 = False):
+def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, only_phase4 = False, use_historic_data = False, historic_data_col = None):
     """
     Handles data cleaning, spatial linking with storage facilities, 
     and sampling the base LPG price from the raster.
@@ -229,8 +231,14 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
             raise ValueError("lpg_price_raster_path and default_gdf are required for ports when only_phase4=False")
 
         # Phase 1: Fill missing values from buffer
-        fill_cols = ['VLGC_compliance', 'cost_source']
+        fill_cols = ['VLGC_compliance', 'cost_source', 'LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025', 'source_price_2023_imp', 'source_price_2023_exp', 'source_price_2024_imp', 'source_price_2024_exp', 'source_price_2025_imp', 'source_price_2025_exp', 'percentage_CITAC']
         gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
+
+        # Phase X (optional): use historic cost series as cost_source
+        if use_historic_data and historic_data_col in default_gdf.columns:
+            fill_cols = historic_data_col
+            gdf = fill_from_buffer(gdf, default_gdf, historic_data_col)
+            gdf['cost_source'] = gdf[historic_data_col]
 
         # Phase 2: Ensure cost_source exists and sample from raster
         if 'cost_source' not in gdf.columns:
@@ -277,9 +285,9 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
 
                 gdf.at[idx, 'LPG_capacity'] = float(sum(allocated_caps))
                 gdf.at[idx, 'tanks_nearby'] = len(nearby)
-                gdf.at[idx, 'LPG_compliance'] = True
-            else:
-                gdf.at[idx, 'LPG_compliance'] = False
+        movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
+        has_valid_movement = any(gdf.at[idx, col] > 0 for col in movement_cols)
+        gdf.at[idx, 'LPG_compliance'] = has_valid_movement
 
     return gdf
 
@@ -367,6 +375,8 @@ from parameters import (
     VEHICLE_F_RURAL, URBAN_THRESHOLD, MIN_VEHICLE_SHARE
 )
 
+# Mattia part
+
 def generate_income_raster(model_pickle_path, scenario_csv_path, output_directory, output_raster_name="income_nigeria", output_variable="absolute_wealth"):
     """Estimates income utilizing the OnStove AWE method and outputs a base income raster, houseold-annual wealth in USD."""
     os.makedirs(output_directory, exist_ok=True)
@@ -393,7 +403,6 @@ def generate_income_raster(model_pickle_path, scenario_csv_path, output_director
     rasters_dir = os.path.join(output_directory, "Rasters")
     if os.path.exists(rasters_dir):
         shutil.rmtree(rasters_dir, ignore_errors=True)
-
 
 def awe_limitation_recovery(
     income_da,
@@ -459,7 +468,6 @@ def awe_limitation_recovery(
     print(f"[AWE Recovery] Input Pixels: {valid_original.sum():,}, Recovered Pixels: {valid.sum():,}")
     return data_imputed, valid
 
-
 def generate_vehicle_possibility(
     input_path,
     output_vehicle_path,
@@ -511,14 +519,12 @@ def generate_vehicle_possibility(
     vehicle_possibility.rio.write_nodata(output_nodata, inplace=True)
     vehicle_possibility.rio.to_raster(output_vehicle_path, compress="DEFLATE", nodata=output_nodata)
 
-
 def _total_vehicles_for_alpha(alpha, s_norm, pop, F_arr, min_share):
     """Internal helper to calculate total allocated vehicles via power relation logic."""
     rates = np.power(s_norm, alpha, dtype=np.float64)
     rates = np.where(rates < min_share, 0.0, rates)
     vehicles = pop * rates / F_arr
     return float(np.sum(vehicles, dtype=np.float64))
-
 
 def allocate_vehicles(vehicle_possibility_path, population_path, urban_raster_path, output_share_car_path, output_share_walk_path, output_cars_path, output_nodata=-9999.0):
     """Allocates vehicle and walking distributions factoring urban vs. rural divides across populations."""

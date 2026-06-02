@@ -18,6 +18,7 @@ driver_annual_salary_usd = 2604
 salary_multiplier = 1.18
 hours_per_day = 8 # working hours per day
 days_per_year = 330 # working days per year
+driver_hourly_cost_usd = (driver_annual_salary_usd * salary_multiplier) / (hours_per_day * days_per_year)
 
 from dataclasses import dataclass
 
@@ -111,7 +112,6 @@ NEIGHBORS = (
     ( 1,  1, math.sqrt(2.0)),
 )
 
-
 # --- Demand Calibration & Allocation Parameters ---
 WALK_THRESHOLD_MIN = 30
 CAR_THRESHOLD_MIN = 45
@@ -119,7 +119,6 @@ URBAN_SHARE = 0.25468    # source ONSTOVE
 RURAL_SHARE = 0.027905   # source ONSTOVE
 URBAN_THRESHOLD = 20
 NODATA_INT = -1
-
 
 # --- Income & Vehicle Allocation Parameters ---
 

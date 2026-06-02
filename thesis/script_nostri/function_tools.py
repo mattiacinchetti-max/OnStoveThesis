@@ -42,6 +42,8 @@ import function_allocation as alloc
 import function_process as process
 from dataclasses import dataclass  
 
+# Francesco part
+
 def _as_vector_layer(gdf, name="mask"):
     """
     Wrap a GeoDataFrame in a VectorLayer for in-memory masking.
@@ -51,7 +53,6 @@ def _as_vector_layer(gdf, name="mask"):
     vect = VectorLayer(name=name)
     vect.data = gdf.copy()
     return vect
-
 
 def load_raster_means(raster_path, band_names, mask_gdf):
     """
@@ -89,7 +90,6 @@ def load_raster_means(raster_path, band_names, mask_gdf):
     result.columns = [1]
     return result
 
-
 def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir):
     """
     Load a layer from user data or defaults, then clip it to mask_gdf.
@@ -122,7 +122,6 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
     gdf['id_supply'] = f"{gpkg_name}_" + gdf.index.astype(str)
     print(f"{gpkg_name}: clipped from default.gpkg/{default_layer_name} in memory ({len(gdf)} records)")
     return gdf
-
 
 def load_border_points_or_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5):
     """
@@ -202,7 +201,6 @@ def load_border_points_or_default(gpkg_name, default_gpkg_path, default_layer_na
     )
     return out
 
-
 def _metric_crs_for_gdf(gdf):
     """
     Return a metric CRS for distance operations.
@@ -220,7 +218,6 @@ def _metric_crs_for_gdf(gdf):
     return CRS.from_proj4(
         f"+proj=aeqd +lat_0={centroid.y} +lon_0={centroid.x} +datum=WGS84 +units=m +no_defs"
     )
-
 
 def _metric_views_for_buffer(gdf, other_gdf):
     """
@@ -249,7 +246,7 @@ def _as_bool_series(series):
 
     return series.apply(_to_bool)
 
-def export_gpkg(points, data_dir, stage=""):
+def export_gpkg(points, data_dir):
     output_path = f"{data_dir}/supply_chain_layer.gpkg"
     order = ['refineries', 'ports', 'gas_plants', 'border_points', 'primary_storage', 'primary_storage_allocated', 'filling_points', 'reseller_points']
     written = 0
@@ -287,8 +284,7 @@ def combine_layers(points: dict, keys: list) -> gpd.GeoDataFrame:
     
     return gpd.GeoDataFrame(combined, crs=layers[0].crs)
 
-
-#new mattia part
+# Mattia part
 
 def _read_raster_base(path: str | Path, positive_only: bool = False):
     """Shared raster read logic for _read_raster and _read_friction."""
@@ -317,7 +313,6 @@ def _read_multiband_raster(path: str | Path):
         desc = list(src.descriptions)
         nodata = src.nodata
     return arr, desc, nodata
-
 
 def write_multiband_raster(
     out_path: Path,
@@ -349,7 +344,6 @@ def write_multiband_raster(
             dst.write(arr.astype(np.float32), i)
             dst.set_band_description(i, name)
 
-
 def _map_points_to_grid(gdf: gpd.GeoDataFrame, transform, width: int, height: int):
     rows, cols = rasterio.transform.rowcol(
         transform, gdf.geometry.x.values, gdf.geometry.y.values
@@ -380,9 +374,6 @@ def _print_progress(
         f"[{mode}] {assigned:,}/{total:,} ({pct:.2f}%) | "
         f"{rate:.1f} px/s | ETA {eta_sec/60:.1f} min"
     )
-
-
-
 
 def read_reference_population(path: Path) -> Tuple[np.ndarray, Dict]:
     """Read population raster and return array + profile."""
@@ -435,9 +426,6 @@ def sanitize_friction(arr: np.ndarray) -> np.ndarray:
     out[invalid] = np.nan
     return out
 
-
-
-
 def _read_pixel_preference_raster(path: str) -> dict[str, np.ndarray]:
     with rasterio.open(path) as src:
         if src.count !=8:   
@@ -469,7 +457,6 @@ def _read_reseller_ids(gdf: gpd.GeoDataFrame) -> np.ndarray:
         raise ValueError(f"Column '{RESELLER_ID_COLUMN}' must be unique in layer '{RESELLER_LAYER}'.")
     return rid.astype(np.int64).to_numpy()
 
-
 def _read_single_band(path: Path) -> tuple[np.ndarray, dict]:
     arr, profile, _ = _read_raster(path)
     return arr, profile
@@ -487,8 +474,6 @@ def income_household_to_per_capita(
     """
     hh_size = np.where(urban_array >= urban_threshold, f_urban, f_rural).astype(np.float32)
     return (income_array / hh_size).astype(np.float32)
-
-
 
 def stack_huff_rasters(
     output_path: Path, 
