@@ -1345,10 +1345,10 @@ def assign_best(
     attractiveness_col: Optional[str] = None,
     output_raster_path: Optional[str] = None,
     pixel_size_m: Optional[float] = None,
-    pop_mask: Optional[str] = None
+    pop_mask: Optional[str] = None,
+    avg_speed_band: bool = False
 ) -> Optional[gpd.GeoDataFrame]:
     """
-
     Uses the existing multisource Dijkstra (which internally applies sqrt(attractiveness)
     scoring when attractiveness differs from 1.0). Exact recomputation is performed
     only when huff=True.
@@ -1528,6 +1528,8 @@ def assign_best(
             out_time[mask] = best_time[mask]
             out_dist[mask] = best_dist[mask]
 
+        band_count = 4 if avg_speed_band else 3
+
         if friction_path:
             with rasterio.open(friction_path) as src:
                 out_meta = src.meta.copy()
@@ -1536,22 +1538,34 @@ def assign_best(
                 "driver": "GTiff",
                 "height": cost_layer.shape[0],
                 "width": cost_layer.shape[1],
-                "count": 3,
+                "count": band_count,
                 "dtype": "float32",
                 "crs": crs_obj,
                 "transform": transform,
                 "nodata": -9999.0,
             }
-        out_meta.update(driver="GTiff", count=3, nodata=-9999.0)
+            
+        out_meta.update(driver="GTiff", count=band_count, nodata=-9999.0)
+        
         band_names = [
             f"nearest_{layer1_name}_id",
             f"nearest_{layer1_name}_time",
             f"nearest_{layer1_name}_distance",
         ]
+
+        if avg_speed_band:       # TODO rimuovi modalità avg_speed_band se non viene piu usata
+            band_names.append(f"nearest_{layer1_name}_speed_kmh")
+            out_speed = np.full(cost_layer.shape, -9999.0, dtype=np.float32)
+            valid_mask = (out_time != -9999.0) & (out_time > 0)
+            out_speed[valid_mask] = out_dist[valid_mask] / (out_time[valid_mask] / 60.0)
+            out_speed[(out_time == 0) & (out_id != -9999)] = 0.0
+
         with rasterio.open(output_raster_path, "w", **out_meta) as dst:
             dst.write(out_id, 1)
             dst.write(out_time.astype(np.float32), 2)
             dst.write(out_dist.astype(np.float32), 3)
+            if avg_speed_band:
+                dst.write(out_speed.astype(np.float32), 4)
             dst.descriptions = band_names
 
     return result_gdf

@@ -992,3 +992,98 @@ def end_user(points: dict, huff_raster_path: str|Path, income_raster_path: str|P
     print(f"✓ 19-Band End-User Price TIF generated successfully: {output_path}")
     print(f"  - Valid Walker pixels: {valid_walk_mask.sum():,}")
     print(f"  - Valid Driver pixels: {valid_driver_mask.sum():,}")
+
+def end_user_multimodal(
+    points: dict, 
+    huff_raster_path: str|Path, 
+    income_raster_path: str|Path, 
+    pop_raster_path: str|Path, 
+    urban_raster_path: str|Path,  
+    lpg_share_path: str|Path, 
+    output_path: str|Path, 
+    van_vehicle: Vehicle,          # Additional parameter for the Van vehicle class
+    threshold_min: float,          # Travel time threshold in minutes to trigger Van transport
+    use_spatial_vot: bool = True
+):
+    """
+    Calculates unified end-user costs introducing a multimodal approach (Van) 
+    for routes where travel time exceeds the specified threshold.
+    Outputs a final 23-band TIF, decomposing transport costs.
+    """
+    # 1. Build dictionary mappings for quick cost lookup from upstream facilities
+    map_resell_cost, map_fill_cost, map_reseller_to_filling = _build_cost_maps(points)
+    
+    # 2. Read the full 8-band Huff allocation raster efficiently
+    with rasterio.open(huff_raster_path) as src:
+        car_share = src.read(1).astype(np.float32)
+        walk_share = src.read(2).astype(np.float32)
+        walk_id = src.read(3).astype(np.float32)
+        walk_time = src.read(4).astype(np.float32)
+        walk_dist = src.read(5).astype(np.float32)
+        car_id = src.read(6).astype(np.float32)
+        car_time = src.read(7).astype(np.float32)
+        car_dist = src.read(8).astype(np.float32)
+        profile = src.profile.copy()
+        
+    height, width = walk_share.shape
+    n = height * width
+    
+    # 3. Read LPG Use Share
+    try:
+        lpg_use_share, _ = tool._read_single_band(lpg_share_path)
+    except Exception as e:
+        raise FileNotFoundError(f"Cannot read LPG use share raster: {lpg_share_path}") from e
+
+    # 4. Compute Spatial Value of Time (VOT) if enabled, else use default
+    if use_spatial_vot and Path(income_raster_path).exists():
+        _, pop_profile = tool._read_single_band(pop_raster_path)
+        income_aligned = tool.reproject_to_reference(Path(income_raster_path), pop_profile, Resampling.bilinear)
+        urban_aligned = tool.reproject_to_reference(Path(urban_raster_path), pop_profile, Resampling.nearest)
+        income_per_capita = tool.income_household_to_per_capita(income_aligned, urban_aligned)
+        vot_raster = _compute_spatial_vot(income_per_capita) 
+    else:
+        vot_raster = np.full((height, width), default_vot_usd_per_hour, dtype=np.float32)
+        
+    vot_flat = vot_raster.reshape(-1).astype(np.float64)
+
+    # =========================================================
+    # A. WALK COST CALCULATION (WALK / MULTIMODAL WALK+VAN)
+    # =========================================================
+    walk_id_flat = walk_id.reshape(-1).astype(np.float64)
+    walk_time_flat = walk_time.reshape(-1).astype(np.float64)
+    walk_dist_flat = walk_dist.reshape(-1).astype(np.float64)
+    
+    with np.errstate(invalid='ignore'):
+        walk_id_int = np.where(np.isfinite(walk_id_flat) & (walk_id_flat > 0), walk_id_flat.astype(np.int64), -1)
+        
+    ref_cost_walk_arr = _map_effective_cost(walk_id_int, map_resell_cost, map_fill_cost)
+    
+    filling_id_walk_arr = np.full(n, -1, dtype=np.int32)
+    filling_cost_walk_arr = np.full(n, np.nan, dtype=np.float64)
+    valid_walk_id = (walk_id_int > 0)
+    
+    if np.any(valid_walk_id):
+        uniq_ids, inv = np.unique(walk_id_int[valid_walk_id], return_inverse=True)
+        fid_mapped = np.array([map_reseller_to_filling.get(int(rid), int(rid)) for rid in uniq_ids], dtype=np.int32)
+        fcost_mapped = np.array([map_fill_cost.get(int(fid), np.nan) for fid in fid_mapped], dtype=np.float64)
+        filling_id_walk_arr[valid_walk_id] = fid_mapped[inv]
+        filling_cost_walk_arr[valid_walk_id] = fcost_mapped[inv]
+
+    # Estimate average speed (km/h) for each pixel
+    walk_speed = np.where(walk_time_flat > 0, walk_dist_flat / (walk_time_flat / 60.0), 0.0)
+
+    # Masks for standard vs multimodal transport
+    mask_walk_standard = (walk_time_flat <= threshold_min)
+    mask_walk_van = (walk_time_flat > threshold_min) & (walk_time_flat > 30.0)
+
+    # Arrays to decompose collection costs
+    collection_cost_walk_base = np.full(n, np.nan, dtype=np.float64)
+    collection_cost_walk_van = np.zeros(n, dtype=np.float64)
+
+    # Standard Case: Walk only
+    if np.any(mask_walk_standard):
+        rt_hours_std = (2.0 * walk_time_flat) / 60.0
+        total_hours_std = rt_hours_std + fixed_time_at_retailer_hours
+        collection_cost_walk_base[mask_walk_standard] = (total_hours_std[mask_walk_standard] * vot_flat[mask_walk_standard]) / cylinder_weight_kg
+
+    # Mult
