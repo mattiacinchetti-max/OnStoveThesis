@@ -495,7 +495,7 @@ def tracking(
             result[f'{c}'] = result[id_col].astype(str).map((agg['wsum'] / agg['wtotal']))
         return result
 
-    # divergence
+    # divergence 
     nearest = f"nearest_{layer1_name}_id"
     if nearest not in result.columns:
         raise ValueError(f"Layer2 missing {nearest}")
@@ -808,7 +808,7 @@ def _map_effective_cost(ids_int: np.ndarray, map_resell: dict, map_fill: dict) -
 
 def end_user(points: dict, huff_raster_path: str|Path, income_raster_path: str|Path, 
              pop_raster_path: str|Path,urban_raster_path: str|Path,  lpg_share_path: str|Path, output_path: str|Path, 
-             use_spatial_vot: bool = True):
+             use_spatial_vot: bool = True): # TODO remove if replaced by multimodal
     """
     Calculates unified end-user costs (walking and driving) and generates the 19-band final TIF.
     """
@@ -1001,8 +1001,8 @@ def end_user_multimodal(
     urban_raster_path: str|Path,  
     lpg_share_path: str|Path, 
     output_path: str|Path, 
-    van_vehicle: Vehicle,          # Additional parameter for the Van vehicle class
-    threshold_min: float,          # Travel time threshold in minutes to trigger Van transport
+    vehicle: Vehicle,          # Additional parameter for the van/vehicle class
+    threshold_min: float,      # Travel time threshold in minutes to trigger Van transport
     use_spatial_vot: bool = True
 ):
     """
@@ -1072,18 +1072,221 @@ def end_user_multimodal(
     # Estimate average speed (km/h) for each pixel
     walk_speed = np.where(walk_time_flat > 0, walk_dist_flat / (walk_time_flat / 60.0), 0.0)
 
-    # Masks for standard vs multimodal transport
-    mask_walk_standard = (walk_time_flat <= threshold_min)
-    mask_walk_van = (walk_time_flat > threshold_min) & (walk_time_flat > 30.0)
+    # Masks for standard vs multimodal transport (NaN safe)
+    mask_walk_standard = np.isfinite(walk_time_flat) & (walk_time_flat >= 0.0) & (walk_time_flat <= threshold_min)
+    mask_walk_van = np.isfinite(walk_time_flat) & (walk_time_flat > threshold_min)
 
-    # Arrays to decompose collection costs
+    # Arrays to decompose collection costs (Initialized to NaN)
     collection_cost_walk_base = np.full(n, np.nan, dtype=np.float64)
-    collection_cost_walk_van = np.zeros(n, dtype=np.float64)
+    collection_cost_walk_van = np.full(n, np.nan, dtype=np.float64)
 
     # Standard Case: Walk only
     if np.any(mask_walk_standard):
         rt_hours_std = (2.0 * walk_time_flat) / 60.0
         total_hours_std = rt_hours_std + fixed_time_at_retailer_hours
         collection_cost_walk_base[mask_walk_standard] = (total_hours_std[mask_walk_standard] * vot_flat[mask_walk_standard]) / cylinder_weight_kg
+        collection_cost_walk_van[mask_walk_standard] = 0.0
 
-    # Mult
+    # Multimodal Case: Walk (up to threshold) + Van (remaining time)
+    if np.any(mask_walk_van):
+        # Segment 1: Walk (fixed to threshold_min)
+        t_walk1 = threshold_min
+        rt_hours_w1 = (2.0 * t_walk1) / 60.0
+        user_time_cost_w1 = (rt_hours_w1 * vot_flat) / cylinder_weight_kg
+
+        # Segment 2: Van transport
+        t_van_w = walk_time_flat - threshold_min
+        d_van_w = walk_speed * (t_van_w / 60.0)
+        
+        # Calculate average van distance for fixed cost amortization
+        avg_d_van_w = float(np.mean(d_van_w[mask_walk_van])) if np.any(d_van_w[mask_walk_van] > 0) else 0.0
+        
+        van_transport_costs_w = np.zeros(n, dtype=np.float64)
+        for idx in np.where(mask_walk_van)[0]:
+            van_transport_costs_w[idx] = single_travel(
+                one_way_distance_km=d_van_w[idx],
+                one_way_time_min=t_van_w[idx],
+                avg_one_way_dist_km=avg_d_van_w,
+                vehicle=vehicle
+            )['total_cost_per_kg']
+
+        retailer_wait_cost = (fixed_time_at_retailer_hours * vot_flat) / cylinder_weight_kg
+
+        # Decompose costs into base (user time) and van components
+        collection_cost_walk_base[mask_walk_van] = user_time_cost_w1[mask_walk_van] + retailer_wait_cost[mask_walk_van]
+        collection_cost_walk_van[mask_walk_van] = van_transport_costs_w[mask_walk_van]
+
+    # Recombine for final walk cost
+    collection_cost_per_kg_walk = collection_cost_walk_base + collection_cost_walk_van
+
+    valid_walk_mask = (np.isfinite(ref_cost_walk_arr) & (walk_id_int > 0) & np.isfinite(collection_cost_per_kg_walk))
+    cost_walk_final = np.full(n, np.nan, dtype=np.float64)
+    cost_walk_final[valid_walk_mask] = ref_cost_walk_arr[valid_walk_mask] + collection_cost_per_kg_walk[valid_walk_mask]
+
+    # =========================================================
+    # B. CAR COST CALCULATION (CAR / MULTIMODAL CAR+VAN)
+    # =========================================================
+    car_id_flat = car_id.reshape(-1).astype(np.float64)
+    car_time_flat = car_time.reshape(-1).astype(np.float64)
+    car_dist_flat = car_dist.reshape(-1).astype(np.float64)
+    
+    with np.errstate(invalid='ignore'):
+        car_id_int = np.where(np.isfinite(car_id_flat) & (car_id_flat > 0), car_id_flat.astype(np.int64), -1)
+        
+    ref_cost_car_arr = _map_effective_cost(car_id_int, map_resell_cost, map_fill_cost)
+    
+    filling_id_car_arr = np.full(n, -1, dtype=np.int32)
+    filling_cost_car_arr = np.full(n, np.nan, dtype=np.float64)
+    valid_car_id = (car_id_int > 0)
+    
+    if np.any(valid_car_id):
+        uniq_ids, inv = np.unique(car_id_int[valid_car_id], return_inverse=True)
+        fid_mapped = np.array([map_reseller_to_filling.get(int(rid), int(rid)) for rid in uniq_ids], dtype=np.int32)
+        fcost_mapped = np.array([map_fill_cost.get(int(fid), np.nan) for fid in fid_mapped], dtype=np.float64)
+        filling_id_car_arr[valid_car_id] = fid_mapped[inv]
+        filling_cost_car_arr[valid_car_id] = fcost_mapped[inv]
+
+    # Estimate average speed (km/h) for each pixel
+    car_speed = np.where(car_time_flat > 0, car_dist_flat / (car_time_flat / 60.0), 0.0)
+
+    # Masks for standard vs multimodal transport (NaN safe)
+    mask_car_standard = np.isfinite(car_time_flat) & (car_time_flat >= 0.0) & (car_time_flat <= threshold_min)
+    mask_car_van = np.isfinite(car_time_flat) & (car_time_flat > threshold_min)
+
+    # Arrays to decompose collection costs (Initialized to NaN)
+    collection_cost_car_base = np.full(n, np.nan, dtype=np.float64)
+    collection_cost_car_van = np.full(n, np.nan, dtype=np.float64)
+
+    # Standard Case: Car only
+    if np.any(mask_car_standard):
+        rt_dist_std = 2.0 * car_dist_flat
+        rt_hours_std = (2.0 * car_time_flat) / 60.0
+        total_hours_std = rt_hours_std + fixed_time_at_retailer_hours
+        
+        voc_trip = rt_dist_std * car_variable_cost_per_km
+        driver_cost_trip = total_hours_std * vot_flat
+        collection_cost_car_base[mask_car_standard] = (voc_trip[mask_car_standard] + driver_cost_trip[mask_car_standard]) / cylinder_weight_kg
+        collection_cost_car_van[mask_car_standard] = 0.0
+
+    # Multimodal Case: Car (up to threshold) + Van (remaining time)
+    if np.any(mask_car_van):
+        # Segment 1: Car (fixed to threshold_min)
+        t_car1 = threshold_min
+        d_car1 = car_speed * (t_car1 / 60.0)
+        rt_dist_c1 = 2.0 * d_car1
+        rt_hours_c1 = (2.0 * t_car1) / 60.0
+        
+        voc_trip_c1 = rt_dist_c1 * car_variable_cost_per_km
+        driver_cost_trip_c1 = rt_hours_c1 * vot_flat
+        car_segment1_cost = (voc_trip_c1 + driver_cost_trip_c1) / cylinder_weight_kg
+
+        # Segment 2: Van transport
+        t_van_c = car_time_flat - threshold_min
+        d_van_c = car_speed * (t_van_c / 60.0)
+        
+        # Calculate average van distance for fixed cost amortization
+        avg_d_van_c = float(np.mean(d_van_c[mask_car_van])) if np.any(d_van_c[mask_car_van] > 0) else 0.0
+        
+        van_transport_costs_c = np.zeros(n, dtype=np.float64)
+        for idx in np.where(mask_car_van)[0]:
+            van_transport_costs_c[idx] = single_travel(
+                one_way_distance_km=d_van_c[idx],
+                one_way_time_min=t_van_c[idx],
+                avg_one_way_dist_km=avg_d_van_c,
+                vehicle=vehicle
+            )['total_cost_per_kg']
+
+        retailer_wait_cost = (fixed_time_at_retailer_hours * vot_flat) / cylinder_weight_kg
+
+        # Decompose costs into base (user time + voc) and van components
+        collection_cost_car_base[mask_car_van] = car_segment1_cost[mask_car_van] + retailer_wait_cost[mask_car_van]
+        collection_cost_car_van[mask_car_van] = van_transport_costs_c[mask_car_van]
+
+    # Recombine for final car cost
+    collection_cost_per_kg_car = collection_cost_car_base + collection_cost_car_van
+
+    valid_driver_mask = (np.isfinite(ref_cost_car_arr) & (car_id_int > 0) & np.isfinite(collection_cost_per_kg_car))
+    cost_car_final = np.full(n, np.nan, dtype=np.float64)
+    cost_car_final[valid_driver_mask] = ref_cost_car_arr[valid_driver_mask] + collection_cost_per_kg_car[valid_driver_mask]
+
+    # =========================================================
+    # C. MEAN & MAJORITY AGGREGATIONS
+    # =========================================================
+    share_walk_arr = np.clip(walk_share.reshape(-1).astype(np.float64), 0.0, 1.0)
+    share_car_arr = np.clip(car_share.reshape(-1).astype(np.float64), 0.0, 1.0)
+    share_sum = share_walk_arr + share_car_arr
+    share_valid = share_sum > 0
+
+    share_walk_norm = np.zeros(n, dtype=np.float64)
+    share_car_norm = np.zeros(n, dtype=np.float64)
+    share_walk_norm[share_valid] = share_walk_arr[share_valid] / share_sum[share_valid]
+    share_car_norm[share_valid] = share_car_arr[share_valid] / share_sum[share_valid]
+
+    both_costs_valid = np.isfinite(cost_walk_final) & np.isfinite(cost_car_final) & share_valid
+
+    mean_user_cost_flat = np.full(n, np.nan, dtype=np.float64)
+    if np.any(both_costs_valid):
+        total_weight = share_walk_norm[both_costs_valid] + share_car_norm[both_costs_valid] 
+        mean_user_cost_flat[both_costs_valid] = (
+            cost_walk_final[both_costs_valid] * share_walk_norm[both_costs_valid] +
+            cost_car_final[both_costs_valid]  * share_car_norm[both_costs_valid]
+        ) / total_weight
+
+    majority_cost_flat = np.full(n, np.nan, dtype=np.float64)
+    walk_majority = (share_walk_norm > share_car_norm)
+    majority_cost_flat[walk_majority] = cost_walk_final[walk_majority]
+    car_majority = ~walk_majority & (share_walk_norm + share_car_norm > 0)
+    majority_cost_flat[car_majority] = cost_car_final[car_majority]
+
+    # =========================================================
+    # D. EXPORT TO 23-BAND TIF
+    # =========================================================
+    out_bands = [
+        car_share, walk_share,
+        np.where(np.isfinite(walk_id) & (walk_id >= 0), walk_id, np.nan),
+        walk_time, walk_dist,
+        np.where(np.isfinite(car_id) & (car_id >= 0), car_id, np.nan),
+        car_time, car_dist,
+        ref_cost_walk_arr.reshape(height, width).astype(np.float32),
+        ref_cost_car_arr.reshape(height, width).astype(np.float32),
+        cost_walk_final.reshape(height, width).astype(np.float32),
+        cost_car_final.reshape(height, width).astype(np.float32),
+        filling_id_walk_arr.reshape(height, width).astype(np.float32),
+        filling_id_car_arr.reshape(height, width).astype(np.float32),
+        filling_cost_walk_arr.reshape(height, width).astype(np.float32),
+        filling_cost_car_arr.reshape(height, width).astype(np.float32),
+        lpg_use_share.astype(np.float32),
+        majority_cost_flat.reshape(height, width).astype(np.float32),
+        mean_user_cost_flat.reshape(height, width).astype(np.float32),
+        
+        # Additional bands for decomposed multimodal costs
+        collection_cost_walk_base.reshape(height, width).astype(np.float32),
+        collection_cost_walk_van.reshape(height, width).astype(np.float32),
+        collection_cost_car_base.reshape(height, width).astype(np.float32),
+        collection_cost_car_van.reshape(height, width).astype(np.float32)
+    ]
+    
+    out_names = [
+        "car_share", "walk_share", "best_reseller_id_walk", "best_time_walk_min", "best_distance_walk_km",
+        "best_reseller_id_car", "best_time_car_min", "best_distance_car_km",
+        "res_cost_kg_out_walk_ref", "res_cost_kg_out_car_ref",
+        "cost_kg_walker", "cost_kg_driver",
+        "filling_id_walk", "filling_id_car",
+        "cost_fil_kg_out_walk_ref", "cost_fil_kg_out_car_ref",
+        "lpg_use_share", "majority_cost_kg", "mean_user_cost",
+        
+        # Names for the additional bands
+        "cost_households_walk",
+        "cost_households_van (walk households)",
+        "cost_households_car",
+        "cost_households_van (car households)"
+    ]
+    
+    # Update profile count to match the new number of bands (23)
+    profile.update(count=len(out_bands))
+    
+    tool.write_multiband_raster(Path(output_path), profile, out_bands, out_names)
+    
+    print(f"✓ 23-Band Multimodal End-User Price TIF generated successfully: {output_path}")
+    print(f"  - Valid Walker pixels: {valid_walk_mask.sum():,}")
+    print(f"  - Valid Driver pixels: {valid_driver_mask.sum():,}")

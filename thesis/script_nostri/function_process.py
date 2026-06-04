@@ -272,7 +272,7 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
             n_connected_ports = sum(1 for p_buf in port_buffers.values() if p_buf.intersects(s_geom))
             storage_connection_counts[s_idx] = n_connected_ports
 
-        # Allocate capacity to ports based on nearby storage
+        ## Allocate capacity to ports based on nearby storage
         for idx, port_buffer in port_buffers.items():
             nearby = storage_metric[storage_metric.geometry.intersects(port_buffer)]
             if len(nearby) > 0:
@@ -285,9 +285,13 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
 
                 gdf.at[idx, 'LPG_capacity'] = float(sum(allocated_caps))
                 gdf.at[idx, 'tanks_nearby'] = len(nearby)
-        movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
-        has_valid_movement = any(gdf.at[idx, col] > 0 for col in movement_cols)
-        gdf.at[idx, 'LPG_compliance'] = has_valid_movement
+
+    movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
+
+    existing_cols = [col for col in movement_cols if col in gdf.columns]
+    
+    if existing_cols:
+        gdf['LPG_compliance'] = gdf[existing_cols].gt(0).any(axis=1)
 
     return gdf
 

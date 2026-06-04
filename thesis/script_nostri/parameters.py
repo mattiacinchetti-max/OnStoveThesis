@@ -41,7 +41,7 @@ tanker = Vehicle(
     life_years=35,
     variable_cost_per_km=0.635,
     annual_km=42000,
-    fixed_loading_unloading_hours=1.0,
+    fixed_loading_unloading_hours=1.0
 )
 
 truck = Vehicle(
@@ -52,10 +52,19 @@ truck = Vehicle(
     life_years=15,
     variable_cost_per_km=0.54,
     annual_km=42000,
-    fixed_loading_unloading_hours=1.0,
+    fixed_loading_unloading_hours=1.0
 )
 
-# TODO car element in vehicle class?
+van = Vehicle(
+    name="van",  
+    capacity_kg=3240,
+    utilization_factor=0.85,
+    overnight_cost_usd=57819,
+    life_years=10,
+    variable_cost_per_km=0.437,
+    annual_km=42000,
+    fixed_loading_unloading_hours=0.25
+)
 
 # license paramters
 license_cost_usd=418

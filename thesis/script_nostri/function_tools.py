@@ -90,73 +90,42 @@ def load_raster_means(raster_path, band_names, mask_gdf):
     result.columns = [1]
     return result
 
-def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir):
+import geopandas as gpd
+from shapely.ops import nearest_points
+
+def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5):
     """
-    Load a layer from user data or defaults, then clip it to mask_gdf.
-    Returns a GeoDataFrame with a stable id_supply column.
-    No files are written during the fallback path.
+    Load a layer from user data or defaults. Keep geometries within mask_gdf,
+    snap points within near_km to the boundary, and drop the rest.
+    Returns a GeoDataFrame with a stable "id_supply" column.
     """
     gpkg_path = data_dir / f"{gpkg_name}.gpkg"
-    mask_vect = _as_vector_layer(mask_gdf, name="mask_layer")
 
+    # Phase 1 & 2: Data Loading
     if gpkg_path.exists():
-        # Phase 1: User data found
-        layer = VectorLayer(name=gpkg_name, path=str(gpkg_path))
-        layer.mask(mask_vect, keep_geom_type=False)
-        gdf = layer.data
-        gdf = gdf.reset_index(drop=True)
-        gdf['id_supply'] = f"{gpkg_name}_" + gdf.index.astype(str)
-        print(f"{gpkg_name}: loaded and clipped in memory ({len(gdf)} records)")
-        return gdf
-
-    # Phase 2: Use default.gpkg layer and clip with mask_layer (no file creation)
-    if not default_gpkg_path.exists():
-        raise FileNotFoundError(f"Missing default gpkg: {default_gpkg_path}")
-
-    default_gdf = gpd.read_file(default_gpkg_path, layer=default_layer_name)
-    default_layer = _as_vector_layer(default_gdf, name=gpkg_name)
-    default_layer.mask(mask_vect, keep_geom_type=False)
-
-    gdf = default_layer.data
-    gdf = gdf.reset_index(drop=True)
-    gdf['id_supply'] = f"{gpkg_name}_" + gdf.index.astype(str)
-    print(f"{gpkg_name}: clipped from default.gpkg/{default_layer_name} in memory ({len(gdf)} records)")
-    return gdf
-
-def load_border_points_or_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5):
-    """
-    Load border points, then keep, snap, or drop by distance to mask_gdf.
-    Points within near_km get snapped to the mask boundary.
-    Returns a GeoDataFrame with id_supply and original attributes.
-    """
-    user_path = data_dir / f"{gpkg_name}.gpkg"
-
-    if user_path.exists():
-        try:
-            points = gpd.read_file(user_path, layer="border_points")
-        except Exception:
-            points = gpd.read_file(user_path)
-        source_name = f"{user_path.name}"
+        gdf = gpd.read_file(gpkg_path)
+        source_name = f"{gpkg_path.name}"
     else:
         if not default_gpkg_path.exists():
             raise FileNotFoundError(f"Missing default gpkg: {default_gpkg_path}")
-        points = gpd.read_file(default_gpkg_path, layer=default_layer_name)
+        gdf = gpd.read_file(default_gpkg_path, layer=default_layer_name)
         source_name = f"{default_gpkg_path.name}/{default_layer_name}"
 
-    if points.empty:
-        print(f"border_points: loaded 0 records from {source_name}")
-        points = points.reset_index(drop=True)
-        points['id_supply'] = "border_points_" + points.index.astype(str)
-        return points
+    if gdf.empty:
+        print(f"{gpkg_name}: loaded 0 records from {source_name}")
+        gdf = gdf.reset_index(drop=True)
+        gdf['id_supply'] = f"{gpkg_name}_" + gdf.index.astype(str)
+        return gdf
 
+    # CRS Validation
     if mask_gdf.crs is None:
-        raise ValueError("mask_layer has no CRS")
-    if points.crs is None:
-        raise ValueError("border_points has no CRS")
+        raise ValueError("mask_gdf has no CRS")
+    if gdf.crs is None:
+        raise ValueError(f"{gpkg_name} has no CRS")
 
-    pts = points.to_crs(mask_gdf.crs).copy()
-
-    pts_m = pts.to_crs("EPSG:3857").copy()
+    # Projection for Metric Distance Calculations
+    original_crs = mask_gdf.crs
+    gdf_m = gdf.to_crs("EPSG:3857").copy()
     mask_m = mask_gdf.to_crs("EPSG:3857")
     mask_union_m = mask_m.geometry.union_all()
 
@@ -167,7 +136,8 @@ def load_border_points_or_default(gpkg_name, default_gpkg_path, default_layer_na
     keep_rows = []
     new_geom_m = []
 
-    for idx, geom_m in zip(pts_m.index, pts_m.geometry):
+    # Keeping, Snapping, and Dropping Logic
+    for idx, geom_m in zip(gdf_m.index, gdf_m.geometry):
         if geom_m is None or geom_m.is_empty:
             dropped_count += 1
             continue
@@ -187,18 +157,19 @@ def load_border_points_or_default(gpkg_name, default_gpkg_path, default_layer_na
         else:
             dropped_count += 1
 
+    # GeoDataFrame Reconstruction
     if len(keep_rows) == 0:
-        out = pts.iloc[0:0].copy()
+        out = gdf.iloc[0:0].copy()
     else:
-        out_m = pts_m.loc[keep_rows].copy()
+        out_m = gdf_m.loc[keep_rows].copy()
         out_m.geometry = new_geom_m
-        out = out_m.to_crs(mask_gdf.crs)
+        out = out_m.to_crs(original_crs)
 
     out = out.reset_index(drop=True)
-    out['id_supply'] = "border_points_" + out.index.astype(str)
-    print(
-        f"border_points: loaded from {source_name} | inside={inside_count}, moved_to_mask={moved_count}, dropped_far={dropped_count}"
-    )
+    out['id_supply'] = f"{gpkg_name}_" + out.index.astype(str)
+    
+    print(f"{gpkg_name}: loaded from {source_name} | inside={inside_count}, moved_to_mask={moved_count}, dropped_far={dropped_count}")
+    
     return out
 
 def _metric_crs_for_gdf(gdf):
@@ -283,6 +254,45 @@ def combine_layers(points: dict, keys: list) -> gpd.GeoDataFrame:
         combined[col] = combined[col].fillna(0.0)
     
     return gpd.GeoDataFrame(combined, crs=layers[0].crs)
+
+def split_layers(combined_gdf: gpd.GeoDataFrame) -> dict[str, gpd.GeoDataFrame]:
+    """
+    Splits a single combined GeoDataFrame back into separate layers
+    based on 'id_supply' prefixes or 'id_res&fil' default naming.
+    Handles compound names like 'border_points' and 'gas_plants'.
+    """
+    if combined_gdf.empty:
+        return {}
+
+    combined = combined_gdf.copy()
+    target_series = pd.Series(index=combined.index, dtype='object')
+
+    # Rule 1: Extract everything before the LAST underscore to support compound names
+    if 'id_supply' in combined.columns:
+        valid_supply = combined['id_supply'].notna() & (combined['id_supply'] != '')
+        if np.any(valid_supply):
+            prefixes = combined.loc[valid_supply, 'id_supply'].astype(str).str.rsplit('_', n=1).str[0]
+            target_series[valid_supply] = prefixes
+
+    # Rule 2: If 'id_res&fil' exists, assign 'filling_points'
+    if 'id_res&fil' in combined.columns:
+        valid_resfil = combined['id_res&fil'].notna() & (combined['id_res&fil'] != '')
+        if np.any(valid_resfil):
+            target_series[valid_resfil] = 'filling_points'
+
+    combined['temporary_layer_name'] = target_series
+    cleaned_combined = combined.dropna(subset=['temporary_layer_name'])
+
+    separated_layers = {}
+    for layer_name, group in cleaned_combined.groupby('temporary_layer_name'):
+        cols_to_drop = ['temporary_layer_name']
+        if 'supply_category' in group.columns:
+            cols_to_drop.append('supply_category')
+            
+        final_gdf = group.drop(columns=cols_to_drop)
+        separated_layers[str(layer_name)] = gpd.GeoDataFrame(final_gdf, crs=combined_gdf.crs)
+
+    return separated_layers
 
 # Mattia part
 

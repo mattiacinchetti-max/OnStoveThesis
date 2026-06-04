@@ -576,6 +576,11 @@ def optimize_storage_allocation(primary_storage_gdf, travel_time_matrix):
     A_eq = np.array(A_eq)
     b_eq = np.array(b_eq)
     
+    #handle case in which some travel times are infinite (no path) by replacing inf with a large finite number
+    finite_values = c[np.isfinite(c)]
+    max_finite = finite_values.max() if finite_values.size > 0 else 1e6
+    c = np.nan_to_num(c, nan=max_finite*10, posinf=max_finite*10)
+
     # Solve LP
     result = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=(0, None), method='highs')
     
