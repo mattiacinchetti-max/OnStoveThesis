@@ -93,10 +93,10 @@ def load_raster_means(raster_path, band_names, mask_gdf):
 import geopandas as gpd
 from shapely.ops import nearest_points
 
-def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5):
+def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5, inward_shift_m=500):
     """
     Load a layer from user data or defaults. Keep geometries within mask_gdf,
-    snap points within near_km to the boundary, and drop the rest.
+    snap points within near_km to a buffered inner boundary (inward_shift_m), and drop the rest.
     Returns a GeoDataFrame with a stable "id_supply" column.
     """
     gpkg_path = data_dir / f"{gpkg_name}.gpkg"
@@ -129,6 +129,11 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
     mask_m = mask_gdf.to_crs("EPSG:3857")
     mask_union_m = mask_m.geometry.union_all()
 
+    inner_mask_m = mask_union_m.buffer(-inward_shift_m)
+    if inner_mask_m.is_empty:
+
+        inner_mask_m = mask_union_m
+
     inside_count = 0
     moved_count = 0
     dropped_count = 0
@@ -148,9 +153,11 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
             new_geom_m.append(geom_m)
             continue
 
+        # La distanza di controllo rimane basata sul confine reale
         dist_m = float(geom_m.distance(mask_union_m))
         if dist_m <= near_km * 1000:
-            snapped = nearest_points(geom_m, mask_union_m)[1]
+            # Lo spostamento (snapping) avviene verso il confine interno
+            snapped = nearest_points(geom_m, inner_mask_m)[1]
             moved_count += 1
             keep_rows.append(idx)
             new_geom_m.append(snapped)
@@ -168,7 +175,7 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
     out = out.reset_index(drop=True)
     out['id_supply'] = f"{gpkg_name}_" + out.index.astype(str)
     
-    print(f"{gpkg_name}: loaded from {source_name} | inside={inside_count}, moved_to_mask={moved_count}, dropped_far={dropped_count}")
+    print(f"{gpkg_name}: loaded from {source_name} | inside={inside_count}, moved_inside_mask={moved_count}, dropped_far={dropped_count}")
     
     return out
 
@@ -217,8 +224,8 @@ def _as_bool_series(series):
 
     return series.apply(_to_bool)
 
-def export_gpkg(points, data_dir):
-    output_path = f"{data_dir}/supply_chain_layer.gpkg"
+def export_gpkg(points, data_dir, country):
+    output_path = f"{data_dir}/supply_chain_layer_{country}.gpkg"
     order = ['refineries', 'ports', 'gas_plants', 'border_points', 'primary_storage', 'primary_storage_allocated', 'filling_points', 'reseller_points']
     written = 0
     for name in order:

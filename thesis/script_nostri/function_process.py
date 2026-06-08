@@ -287,11 +287,22 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
                 gdf.at[idx, 'tanks_nearby'] = len(nearby)
 
     movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
-
     existing_cols = [col for col in movement_cols if col in gdf.columns]
     
+    # 1. Condizione sui movimenti: True se almeno una colonna ha valore > 0
     if existing_cols:
-        gdf['LPG_compliance'] = gdf[existing_cols].gt(0).any(axis=1)
+        cond_movements = gdf[existing_cols].gt(0).any(axis=1)
+    else:
+        cond_movements = False
+        
+    # 2. Condizione sulla conformità VLGC
+    cond_vlgc = gdf['VLGC_compliance'] == True
+    
+    # 3. Condizione sulla capacità
+    cond_capacity = gdf['LPG_capacity'] > 0
+    
+    # Assegnazione vettorializzata: True se almeno una delle condizioni è vera
+    gdf['LPG_compliance'] = cond_movements | cond_vlgc | cond_capacity
 
     return gdf
 
@@ -320,12 +331,14 @@ def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     return gdf
 
 
-def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, price_band=1):
+def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, country, price_band=1):
     """
     Handles data initialization, spatial filling, raster sampling, 
     and supply share allocation for border points.
     """
     bp = gdf.copy()
+
+    bp = bp[bp['to_iso3'] == country]
 
     if bp.empty:
         for col in ['cost_source', 'osbp', 'border_ferry', 'percentage', 'category']:

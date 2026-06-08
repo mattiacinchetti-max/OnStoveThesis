@@ -51,7 +51,7 @@ truck = Vehicle(
     overnight_cost_usd=170200,
     life_years=15,
     variable_cost_per_km=0.54,
-    annual_km=42000,
+    annual_km=16000,
     fixed_loading_unloading_hours=1.0
 )
 
@@ -62,7 +62,7 @@ van = Vehicle(
     overnight_cost_usd=57819,
     life_years=10,
     variable_cost_per_km=0.437,
-    annual_km=42000,
+    annual_km=16000,
     fixed_loading_unloading_hours=0.25
 )
 

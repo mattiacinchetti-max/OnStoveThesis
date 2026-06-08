@@ -249,7 +249,7 @@ def calculate_percentages_supply(
     refineries_cols='crude_capacity', 
     ports_cols='LPG_capacity', 
     gas_plants_cols='LPG_prod', 
-    border_points_cols=None
+    border_points_cols='percentage_importer'
     ):
     """
     Calculate facility-level market shares from national shares and capacities.
