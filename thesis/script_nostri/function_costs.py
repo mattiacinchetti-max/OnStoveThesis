@@ -708,6 +708,7 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
 
                 # For each reseller, average the valid 2x2 neighbourhood
                 inc_vals = np.full(valid_geom.sum(), np.nan)
+                urb_vals_sampled = np.full(valid_geom.sum(), np.nan)
                 for k, (r, c) in enumerate(zip(rows, cols)):
                     r0, r1 = max(r - 1, 0), min(r + 1, H)   # clip to array bounds
                     c0, c1 = max(c - 1, 0), min(c + 1, W)
@@ -716,8 +717,22 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
                     valid = np.isfinite(patch_inc) & (patch_inc > 0)
                     if valid.any():
                         inc_vals[k] = patch_inc[valid].mean()
+                        urb_vals_sampled[k] = patch_urb[valid].mean()
 
                 resell_income_monthly[valid_geom] = inc_vals
+                # Step 1 – household → per-capita (use spatially differentiated HH size)
+                urb_vals = np.full(n_resellers, np.nan)
+                urb_vals[valid_geom] = urb_vals_sampled
+                
+                hh_size = np.where(
+                    np.isfinite(urb_vals) & (urb_vals >= URBAN_THRESHOLD),
+                    VEHICLE_F_URBAN,   
+                    VEHICLE_F_RURAL   
+                )
+                resell_income_pc_annual = resell_income_monthly / hh_size   # still annual, per capita
+
+                # Step 2 – annual → monthly
+                resell_income_monthly = resell_income_pc_annual / 12.0      # now truly monthly per capita
                     
     # 3. Apply minimum wage floor
     income_monthly_used = np.where(
@@ -747,6 +762,8 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
 
 def _compute_spatial_vot(income_array: np.ndarray) -> np.ndarray:
     """Computes the spatial Value of Time (VOT) based on local income."""
+    # income_array is used only for RELATIVE ranking across pixels (min-max normalisation).
+    # Absolute units do not affect the output — the wage anchor is minimum_wage_usd_per_month.
     valid = np.isfinite(income_array)
     vot = np.full(income_array.shape, default_vot_usd_per_hour, dtype=np.float32)
     
