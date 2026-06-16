@@ -630,6 +630,7 @@ def filling(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     df = gdf.copy()
     
     # 1. Determine inbound cost (accumulated total cost up to this point)
+    df = cost.total(df)
     cost_in = pd.to_numeric(df.get('cost_total', 0.0), errors='coerce').fillna(0.0)
     
     # 2. Compute Annualized Fixed Costs
@@ -656,6 +657,7 @@ def filling(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     
     # 5. Store specific filling plant cost component
     df['cost_fil_plants'] = np.maximum(0.0, cost_out - cost_in)
+    df = cost.total(df)
     
     return df
 
@@ -667,7 +669,7 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
     """
     resell = resell_gdf.copy()
     filling = filling_gdf.copy()
-    
+    resell = cost.total(resell)
     # 1. System average demand calculation
     assigned_col = next((c for c in ['assigned_fil_clients', 'total_fil_clients'] if c in filling.columns), None)
     if assigned_col == 'assigned_fil_clients':
@@ -770,7 +772,7 @@ def reseller(resell_gdf: gpd.GeoDataFrame, filling_gdf: gpd.GeoDataFrame, income
     cost_out = np.where(cost_in > 0, np.minimum(cost_out_uncapped, max_cost_out), 0.0)
     
     resell['cost_res_shop'] = np.maximum(0.0, cost_out - cost_in)
-    
+    resell = cost.total(resell)
     return resell
 
 def _compute_spatial_vot(income_array: np.ndarray) -> np.ndarray:
