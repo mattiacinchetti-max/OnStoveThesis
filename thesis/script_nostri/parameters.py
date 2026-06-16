@@ -91,6 +91,10 @@ storage_license_life_years = 3
 discount_rate_storage = float(globals().get("discount_rate", 0.03))
 storage_cap = 0.25 #US$/kg, maximum price for storage cost, used to cap outliers in the data when USE_DIFFERENTIATED_STORAGE_COSTS is True
 
+# Risk aversion 
+aversion_coeff = 2
+std_dev = 0.40351 # source: NGA historic prices TODO find a more reliable source
+
 #new part
 import math
 

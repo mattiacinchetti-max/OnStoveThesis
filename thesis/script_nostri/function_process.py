@@ -188,70 +188,71 @@ def redistribute_small_national_shares(nat_shares_df, min_share_pct=1.0):
     
     return out
 
-def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1, mask_layer=mask_layer):
+def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1, mask_layer=None):
     """
     Fill missing values and add LPG price from raster sampling.
     Ensures crude capacity is numeric and non-null.
     Applies buffer-based defaults before raster sampling.
     Returns a cleaned GeoDataFrame in the original CRS.
     """
-    gdf = gdf.copy()
+    if not gdf.empty:
+        gdf = gdf.copy()
 
-    # Phase 1: Fill from buffer
-    fill_cols = ['crude_capacity', 'cost_source']
-    gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
+        # Phase 1: Fill from buffer
+        fill_cols = ['crude_capacity', 'cost_source']
+        gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure production and fill cost_source from raster
-    if 'crude_capacity' not in gdf.columns:
-        gdf['crude_capacity'] = 0.0
-    else:
-        gdf['crude_capacity'] = pd.to_numeric(gdf['crude_capacity'], errors='coerce').fillna(0.0)
+        # Phase 2: Ensure production and fill cost_source from raster
+        if 'crude_capacity' not in gdf.columns:
+            gdf['crude_capacity'] = 0.0
+        else:
+            gdf['crude_capacity'] = pd.to_numeric(gdf['crude_capacity'], errors='coerce').fillna(0.0)
 
-    gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
 
-    missing_prices = int(gdf['cost_source'].isna().sum())
-    if missing_prices > 0:
-        print(f"Warning: {missing_prices} refinery rows still have missing cost_source after raster sampling")
-
+        missing_prices = int(gdf['cost_source'].isna().sum())
+        if missing_prices > 0:
+            print(f"Warning: {missing_prices} refinery rows still have missing cost_source after raster sampling")
     return gdf
 
 
-def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1, mask_layer=mask_layer):
+def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1, mask_layer=None):
     """
     Fill missing values and add LPG price from raster sampling.
     Normalizes LPG production to numeric values.
     Applies buffer-based defaults before raster sampling.
     Returns a cleaned GeoDataFrame in the original CRS.
     """
-    gdf = gdf.copy()
+    if not gdf.empty:
+        gdf = gdf.copy()
 
-    # Phase 1: Fill from buffer
-    fill_cols = ['LPG_prod', 'cost_source']
-    gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
+        # Phase 1: Fill from buffer
+        fill_cols = ['LPG_prod', 'cost_source']
+        gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure production and fill cost_source from raster
-    if 'LPG_prod' not in gdf.columns:
-        gdf['LPG_prod'] = 0.0
-    else:
-        gdf['LPG_prod'] = pd.to_numeric(gdf['LPG_prod'], errors='coerce').fillna(0.0)
+        # Phase 2: Ensure production and fill cost_source from raster
+        if 'LPG_prod' not in gdf.columns:
+            gdf['LPG_prod'] = 0.0
+        else:
+            gdf['LPG_prod'] = pd.to_numeric(gdf['LPG_prod'], errors='coerce').fillna(0.0)
 
-    gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
 
-    missing_prices = int(gdf['cost_source'].isna().sum())
-    if missing_prices > 0:
-        print(f"Warning: {missing_prices} gas plant rows still have missing cost_source after raster sampling")
+        missing_prices = int(gdf['cost_source'].isna().sum())
+        if missing_prices > 0:
+            print(f"Warning: {missing_prices} gas plant rows still have missing cost_source after raster sampling")
 
     return gdf
 
 
-def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, only_phase4 = False, use_historic_data = False, historic_data_col = None, mask_layer=mask_layer):
+def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, use_historic_data = False, historic_data_col = None, mask_layer=None):
     """
     Handles data cleaning, spatial linking with storage facilities, 
     and sampling the base LPG price from the raster.
     """
-    gdf = gdf.copy()
+    if not gdf.empty:
+        gdf = gdf.copy()
 
-    if not only_phase4:
         if lpg_price_raster_path is None and default_gdf is None:
             raise ValueError("lpg_price_raster_path and default_gdf are required for ports when only_phase4=False")
 
@@ -281,53 +282,49 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
         else:
             gdf['VLGC_compliance'] = gdf['VLGC_compliance'].fillna(False)
 
-    # Phase 4: Spatial join with storage facilities
-    if storage_gdf is not None:
-        gdf = gdf.to_crs(storage_gdf.crs)
-        gdf_metric, storage_metric = tool._metric_views_for_buffer(gdf, storage_gdf)
-        buffer_dist = BUFFER_KM * 1000.0
+        # Phase 4: Spatial join with storage facilities
+        if storage_gdf is not None:
+            gdf = gdf.to_crs(storage_gdf.crs)
+            gdf_metric, storage_metric = tool._metric_views_for_buffer(gdf, storage_gdf)
+            buffer_dist = BUFFER_KM * 1000.0
 
-        # Precompute buffers for all ports
-        port_buffers = {idx: geom.buffer(buffer_dist) for idx, geom in gdf_metric.geometry.items()}
+            # Precompute buffers for all ports
+            port_buffers = {idx: geom.buffer(buffer_dist) for idx, geom in gdf_metric.geometry.items()}
 
-        # Count connections per storage to allow capacity de-duplication
-        storage_connection_counts = {}
-        for s_idx, s_row in storage_metric.iterrows():
-            s_geom = s_row.geometry
-            n_connected_ports = sum(1 for p_buf in port_buffers.values() if p_buf.intersects(s_geom))
-            storage_connection_counts[s_idx] = n_connected_ports
+            # Count connections per storage to allow capacity de-duplication
+            storage_connection_counts = {}
+            for s_idx, s_row in storage_metric.iterrows():
+                s_geom = s_row.geometry
+                n_connected_ports = sum(1 for p_buf in port_buffers.values() if p_buf.intersects(s_geom))
+                storage_connection_counts[s_idx] = n_connected_ports
 
-        ## Allocate capacity to ports based on nearby storage
-        for idx, port_buffer in port_buffers.items():
-            nearby = storage_metric[storage_metric.geometry.intersects(port_buffer)]
-            if len(nearby) > 0:
-                allocated_caps = []
-                for s_idx, s_row in nearby.iterrows():
-                    raw_cap = float(s_row['LPG_capacity']) if ('LPG_capacity' in nearby.columns and pd.notna(s_row.get('LPG_capacity'))) else 0.0
-                    n_conn = storage_connection_counts.get(s_idx, 0)
-                    if n_conn > 0:
-                        allocated_caps.append(raw_cap / n_conn)
+            ## Allocate capacity to ports based on nearby storage
+            for idx, port_buffer in port_buffers.items():
+                nearby = storage_metric[storage_metric.geometry.intersects(port_buffer)]
+                if len(nearby) > 0:
+                    allocated_caps = []
+                    for s_idx, s_row in nearby.iterrows():
+                        raw_cap = float(s_row['LPG_capacity']) if ('LPG_capacity' in nearby.columns and pd.notna(s_row.get('LPG_capacity'))) else 0.0
+                        n_conn = storage_connection_counts.get(s_idx, 0)
+                        if n_conn > 0:
+                            allocated_caps.append(raw_cap / n_conn)
 
-                gdf.at[idx, 'LPG_capacity'] = float(sum(allocated_caps))
-                gdf.at[idx, 'tanks_nearby'] = len(nearby)
+                    gdf.at[idx, 'LPG_capacity'] = float(sum(allocated_caps))
+                    gdf.at[idx, 'tanks_nearby'] = len(nearby)
 
-    movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
-    existing_cols = [col for col in movement_cols if col in gdf.columns]
-    
-    # 1. Condizione sui movimenti: True se almeno una colonna ha valore > 0
-    if existing_cols:
-        cond_movements = gdf[existing_cols].gt(0).any(axis=1)
-    else:
-        cond_movements = False
+        movement_cols = ['LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025']
+        existing_cols = [col for col in movement_cols if col in gdf.columns]
         
-    # 2. Condizione sulla conformità VLGC
-    cond_vlgc = gdf['VLGC_compliance'] == True
-    
-    # 3. Condizione sulla capacità
-    cond_capacity = gdf['LPG_capacity'] > 0
-    
-    # Assegnazione vettorializzata: True se almeno una delle condizioni è vera
-    gdf['LPG_compliance'] = cond_movements | cond_vlgc | cond_capacity
+        if existing_cols:
+            cond_movements = gdf[existing_cols].gt(0).any(axis=1)
+        else:
+            cond_movements = False
+            
+        cond_vlgc = gdf['VLGC_compliance'] == True
+        
+        cond_capacity = gdf['LPG_capacity'] > 0
+        
+        gdf['LPG_compliance'] = cond_movements | cond_vlgc | cond_capacity
 
     return gdf
 
@@ -339,63 +336,65 @@ def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     Initializes cost_source as NaN for later steps.
     Returns a cleaned GeoDataFrame in the original CRS.
     """
-    gdf = gdf.copy()
+    if not gdf.empty:
+        gdf = gdf.copy()
 
-    # Phase 1: Fill from buffer for LPG_capacity 
-    fill_cols = ['LPG_capacity']
-    gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
+        # Phase 1: Fill from buffer for LPG_capacity 
+        fill_cols = ['LPG_capacity']
+        gdf = fill_from_buffer(gdf, default_gdf, fill_cols)
 
-    # Phase 2: Ensure storage capacity
-    if 'LPG_capacity' not in gdf.columns:
-        gdf['LPG_capacity'] = 0.0
-    else:
-        gdf['LPG_capacity'] = gdf['LPG_capacity'].fillna(0.0)
+        # Phase 2: Ensure storage capacity
+        if 'LPG_capacity' not in gdf.columns:
+            gdf['LPG_capacity'] = 0.0
+        else:
+            gdf['LPG_capacity'] = gdf['LPG_capacity'].fillna(0.0)
 
-    gdf['cost_source'] = np.nan
+        gdf['cost_source'] = np.nan
 
     return gdf
 
 
-def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, country, price_band=1, mask_layer=mask_layer):
+def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, country, price_band=1, mask_layer=None):
     """
     Handles data initialization, spatial filling, raster sampling, 
     and supply share allocation for border points.
     """
-    bp = gdf.copy()
+    if not gdf.empty:
+        bp = gdf.copy()
 
-    bp = bp[bp['to_iso3'] == country]
+        bp = bp[bp['to_iso3'] == country]
 
-    if bp.empty:
-        for col in ['cost_source', 'osbp', 'border_ferry', 'percentage', 'category']:
-            bp[col] = pd.Series(dtype='float64' if col not in ['osbp', 'border_ferry', 'category'] else 'object')
-        return bp
+        if bp.empty:
+            for col in ['cost_source', 'osbp', 'border_ferry', 'percentage', 'category']:
+                bp[col] = pd.Series(dtype='float64' if col not in ['osbp', 'border_ferry', 'category'] else 'object')
+            return bp
 
-    # Phase 1: Initialize columns and handle missing data
-    if 'cost_source' not in bp.columns: bp['cost_source'] = np.nan
-    if 'osbp' not in bp.columns: 
-        bp['osbp'] = np.nan
-    if 'border_ferry' not in bp.columns: 
-        bp['border_ferry'] = np.nan
+        # Phase 1: Initialize columns and handle missing data
+        if 'cost_source' not in bp.columns: bp['cost_source'] = np.nan
+        if 'osbp' not in bp.columns: 
+            bp['osbp'] = np.nan
+        if 'border_ferry' not in bp.columns: 
+            bp['border_ferry'] = np.nan
 
-    # Phase 2: Fill from buffer and raster
-    bp = fill_from_buffer(bp, default_gdf, ['cost_source', 'osbp', 'border_ferry'])
-    bp = fill_lpg_price_from_raster(bp, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        # Phase 2: Fill from buffer and raster
+        bp = fill_from_buffer(bp, default_gdf, ['cost_source', 'osbp', 'border_ferry'])
+        bp = fill_lpg_price_from_raster(bp, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
 
-    bp['osbp'] = bp['osbp'].replace('', np.nan).fillna('no')
-    bp['border_ferry'] = bp['border_ferry'].replace('', np.nan).fillna('no')
+        bp['osbp'] = bp['osbp'].replace('', np.nan).fillna('no')
+        bp['border_ferry'] = bp['border_ferry'].replace('', np.nan).fillna('no')
 
-    # Phase 3: Share (percentage) logic
-    border_share = float(nat_shares_df.loc['border_points'].iloc[0]) / 100.0
+        # Phase 3: Share (percentage) logic
+        border_share = float(nat_shares_df.loc['border_points'].iloc[0]) / 100.0
 
-    if 'percentage' in bp.columns and bp['percentage'].notna().any():
-        bp['percentage'] = bp['percentage'].fillna(0.0)
-    elif 'LPG_capacity' in bp.columns and pd.to_numeric(bp['LPG_capacity'], errors='coerce').sum() > 0:
-        weights = pd.to_numeric(bp['LPG_capacity'], errors='coerce').fillna(0.0)
-        bp['percentage'] = border_share * (weights / weights.sum())
-    else:
-        osbp_flag = tool._as_bool_series(bp['osbp'])
-        weights = pd.Series(np.where(osbp_flag, 2.0, 1.0), index=bp.index)
-        bp['percentage'] = border_share * (weights / weights.sum())
+        if 'percentage' in bp.columns and bp['percentage'].notna().any():
+            bp['percentage'] = bp['percentage'].fillna(0.0)
+        elif 'LPG_capacity' in bp.columns and pd.to_numeric(bp['LPG_capacity'], errors='coerce').sum() > 0:
+            weights = pd.to_numeric(bp['LPG_capacity'], errors='coerce').fillna(0.0)
+            bp['percentage'] = border_share * (weights / weights.sum())
+        else:
+            osbp_flag = tool._as_bool_series(bp['osbp'])
+            weights = pd.Series(np.where(osbp_flag, 2.0, 1.0), index=bp.index)
+            bp['percentage'] = border_share * (weights / weights.sum())
         
     return bp
 

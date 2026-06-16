@@ -153,10 +153,9 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
             new_geom_m.append(geom_m)
             continue
 
-        # La distanza di controllo rimane basata sul confine reale
+        
         dist_m = float(geom_m.distance(mask_union_m))
         if dist_m <= near_km * 1000:
-            # Lo spostamento (snapping) avviene verso il confine interno
             snapped = nearest_points(geom_m, inner_mask_m)[1]
             moved_count += 1
             keep_rows.append(idx)

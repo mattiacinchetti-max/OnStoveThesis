@@ -51,33 +51,34 @@ def ports(gdf, import_cost_df):
     Calculates extra costs (Import, STS, Pre-bottling) and updates final price.
     Each cost component is saved as a separate attribute.
     """
-    gdf = gdf.copy()
-    
-    # Retrieve base import rate from the dataframe
-    import_sea_rate = import_cost_df.loc['import_sea'].iloc[0]
+    if not gdf.empty:
+        gdf = gdf.copy()
+        
+        # Retrieve base import rate from the dataframe
+        import_sea_rate = import_cost_df.loc['import_sea'].iloc[0]
 
-    # Initialize individual cost columns
-    gdf['cost_import_sea'] = 0.0
-    gdf['cost_sts'] = 0.0
-    gdf['cost_pre_bottling'] = 0.0
+        # Initialize individual cost columns
+        gdf['cost_import_sea'] = 0.0
+        gdf['cost_sts'] = 0.0
+        gdf['cost_pre_bottling'] = 0.0
 
-    # 1. Sea Import Cost: Applied to all ports based on the base price
-    gdf['cost_import_sea'] = gdf['cost_source'] * import_sea_rate
+        # 1. Sea Import Cost: Applied to all ports based on the base price
+        gdf['cost_import_sea'] = gdf['cost_source'] * import_sea_rate
 
-    # 2. STS Cost: Applied if storage is available (LPG_compliance) but port is NOT VLGC compliant
-    mask_sts = (gdf['LPG_compliance'] == True) & (gdf['VLGC_compliance'] == False)
-    gdf.loc[mask_sts, 'cost_sts'] = STS_cost
+        # 2. STS Cost: Applied if storage is available (LPG_compliance) but port is NOT VLGC compliant
+        mask_sts = (gdf['LPG_compliance'] == True) & (gdf['VLGC_compliance'] == False)
+        gdf.loc[mask_sts, 'cost_sts'] = STS_cost
 
-    # 3. Pre-bottling Cost: Applied only if no nearby storage is available
-    # It is calculated on the price already including sea import costs
-    mask_no_storage = (gdf['LPG_compliance'] == False)
-    price_after_import = gdf['cost_source'] + gdf['cost_import_sea']
-    gdf.loc[mask_no_storage, 'cost_pre_bottling'] = price_after_import * pre_bottling_cost
+        # 3. Pre-bottling Cost: Applied only if no nearby storage is available
+        # It is calculated on the price already including sea import costs
+        mask_no_storage = (gdf['LPG_compliance'] == False)
+        price_after_import = gdf['cost_source'] + gdf['cost_import_sea']
+        gdf.loc[mask_no_storage, 'cost_pre_bottling'] = price_after_import * pre_bottling_cost
 
-    # Check for remaining missing prices
-    missing_prices = int(gdf['cost_source'].isna().sum())
-    if missing_prices > 0:
-        print(f"Warning: {missing_prices} port rows have missing cost_source after cost calculation")
+        # Check for remaining missing prices
+        missing_prices = int(gdf['cost_source'].isna().sum())
+        if missing_prices > 0:
+            print(f"Warning: {missing_prices} port rows have missing cost_source after cost calculation")
 
     return gdf
 
@@ -86,40 +87,52 @@ def border_points(gdf, import_cost_df, vehicle: Vehicle):
     Calculates Land Import costs, Border Time costs, and Ferry costs.
     Updates final cost_source and stores individual components as attributes.
     """
-    bp = gdf.copy()
-    
-    # Initialize cost attribute columns
-    bp['cost_import_land'] = 0.0
-    bp['cost_border_wait'] = 0.0
-    bp['cost_ferry'] = 0.0
+    if not gdf.empty:
+        bp = gdf.copy()
+        
+        # Initialize cost attribute columns
+        bp['cost_import_land'] = 0.0
+        bp['cost_border_wait'] = 0.0
+        bp['cost_ferry'] = 0.0
 
-    # 1. Land Import Cost (Percentage markup on base price)
-    import_land_rate = float(import_cost_df.loc['import_land'].iloc[0])
-    bp['cost_import_land'] = bp['cost_source'] * import_land_rate
+        # 1. Land Import Cost (Percentage markup on base price)
+        import_land_rate = float(import_cost_df.loc['import_land'].iloc[0])
+        bp['cost_import_land'] = bp['cost_source'] * import_land_rate
 
-    # Logistics constants for cost calculation
-    effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
-    driver_hourly_cost_usd = (driver_annual_salary_usd * salary_multiplier) / (hours_per_day * days_per_year)
+        # Logistics constants for cost calculation
+        effective_load_kg = vehicle.capacity_kg * vehicle.utilization_factor
+        driver_hourly_cost_usd = (driver_annual_salary_usd * salary_multiplier) / (hours_per_day * days_per_year)
 
-    # 2. Border Waiting Time Cost
-    # Logic: OSBP (One-Stop Border Post) reduces waiting time by half
-    osbp_flags = tool._as_bool_series(bp['osbp']).to_numpy(dtype=bool)
-    wait_hours = np.where(osbp_flags, border_point_time_hours / 2.0, border_point_time_hours)
-    border_time_cost_trip = wait_hours * driver_hourly_cost_usd
-    bp['cost_border_wait'] = border_time_cost_trip / effective_load_kg
+        # 2. Border Waiting Time Cost
+        # Logic: OSBP (One-Stop Border Post) reduces waiting time by half
+        osbp_flags = tool._as_bool_series(bp['osbp']).to_numpy(dtype=bool)
+        wait_hours = np.where(osbp_flags, border_point_time_hours / 2.0, border_point_time_hours)
+        border_time_cost_trip = wait_hours * driver_hourly_cost_usd
+        bp['cost_border_wait'] = border_time_cost_trip / effective_load_kg
 
-    # 3. Ferry Cost (if applicable)
-    if 'border_ferry' in bp.columns:
-        is_ferry = tool._as_bool_series(bp['border_ferry']).to_numpy(dtype=bool)
-        if is_ferry.any():
-            # Ferry cost = distance * (rate per km + time-based driver cost)
-            ferry_extra_cost_trip = bp['distance_ferry'] * (
-                bp.get('ferry_cost_per_km', ferry_cost_per_km) + 
-                (bp.get('ferry_time_per_km', ferry_time_per_km) * driver_hourly_cost_usd)
-            )
-            bp.loc[is_ferry, 'cost_ferry'] = ferry_extra_cost_trip / effective_load_kg
+        # 3. Ferry Cost (if applicable)
+        if 'border_ferry' in bp.columns:
+            is_ferry = tool._as_bool_series(bp['border_ferry']).to_numpy(dtype=bool)
+            if is_ferry.any():
+                # Ferry cost = distance * (rate per km + time-based driver cost)
+                ferry_extra_cost_trip = bp['distance_ferry'] * (
+                    bp.get('ferry_cost_per_km', ferry_cost_per_km) + 
+                    (bp.get('ferry_time_per_km', ferry_time_per_km) * driver_hourly_cost_usd)
+                )
+                bp.loc[is_ferry, 'cost_ferry'] = ferry_extra_cost_trip / effective_load_kg
+        gdf=bp.copy()
 
-    return bp
+    return gdf
+
+def risk_aversion(gdf, aversion_coeff, std_dev):
+    """
+    Adjusts costs based on risk aversion using a quadratic function of the coefficient of variation.
+    This penalizes higher variability in costs, reflecting risk-averse behavior.
+    """
+    gdf = gdf.copy()
+    gdf['cost_risk_aversion'] = aversion_coeff * std_dev**2
+
+    return gdf
 
 def crf(rate: float, years: int) -> float:
     """
