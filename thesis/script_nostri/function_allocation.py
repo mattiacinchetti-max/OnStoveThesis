@@ -791,7 +791,7 @@ def calibrate_demand_and_allocate_clients(
     clients_max_ideal_walk_pixel = pixel_pop * walk_share
     clients_max_ideal_car_pixel = pixel_pop * car_share
 
-    # 3. Save LPG Use Raster (Still writes to disk as requested)
+    # 3. Save LPG Use Raster
     lpg_use_share_raster = np.zeros((height, width), dtype=np.float32)
     lpg_use_share_raster[~mask_nigeria] = NODATA_FLOAT
     lpg_use_share_raster[rows, cols] = lpg_use_share_pixel.astype(np.float32)
@@ -889,7 +889,7 @@ def connected_components_8(mask: np.ndarray) -> np.ndarray:
     Returns an integer array (0 = background).
     Falls back to pure Python if scipy is not available.
     """
-    # Try to use scipy first (much faster)
+    
     try:
         from scipy import ndimage
         structure = np.ones((3, 3), dtype=np.uint8)
