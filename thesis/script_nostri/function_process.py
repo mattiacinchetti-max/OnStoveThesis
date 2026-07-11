@@ -77,118 +77,7 @@ def fill_from_buffer(gdf, default_gdf, cols, buffer_km=BUFFER_KM):
                     gdf.at[idx, col] = val.iloc[0]
     return gdf
 
-def fill_lpg_price_from_raster(gdf, raster_path, band_index=1, overwrite=False, mask_layer=None, average=True):
-    """
-    Sample a raster at facility locations and fill cost_source.
-    Handles non-point geometries via centroids.
-    If average=True and mask_layer is provided, assigns the mean raster value within mask_layer to all elements.
-    Only fills missing values unless overwrite=True.
-    """
-    out = gdf.copy()
-
-    if out.crs is None:
-        raise ValueError("Input GeoDataFrame has no CRS")
-
-    if 'cost_source' not in out.columns:
-        out['cost_source'] = np.nan
-
-    raster_file = Path(raster_path)
-    if not raster_file.exists():
-        raise FileNotFoundError(f"Missing LPG price raster: {raster_file}")
-
-    if average and mask_layer is None:
-        raise ValueError("Cannot compute average without a valid mask_layer.")
-
-    with rasterio.open(raster_file) as src:
-        if src.crs is None:
-            raise ValueError("LPG price raster has no CRS")
-        if band_index < 1 or band_index > src.count:
-            raise ValueError(f"Requested band {band_index} for {raster_file.name}, but raster has {src.count} band(s)")
-
-        # Reproject the input GeoDataFrame
-        work = out.to_crs(src.crs).copy()
-        sampled_values = np.full(len(work), np.nan, dtype=np.float64)
-
-        if average:
-            # 1. Reproject the mask_layer to match the raster
-            mask_proj = mask_layer.to_crs(src.crs)
-            
-            # 2. Crop the raster using the mask_layer geometries
-            out_image, _ = rasterio.mask.mask(src, mask_proj.geometry, crop=True)
-            band_data = out_image[band_index - 1] # rasterio uses 1-based indices for bands, numpy arrays are 0-based
-            
-            # 3. Isolate valid data by removing the "nodata" value
-            if src.nodata is not None:
-                valid_data = band_data[band_data != src.nodata]
-            else:
-                valid_data = band_data
-                
-            # 4. Calculate the mean and assign it to all elements
-            if valid_data.size > 0:
-                mean_value = float(np.nanmean(valid_data))
-                sampled_values.fill(mean_value)
-
-        else:
-            # Original behavior: point sampling
-            geom_series = work.geometry
-            if not work.geom_type.eq('Point').all():
-                geom_series = work.geometry.centroid
-
-            valid_positions = []
-            valid_coords = []
-
-            for pos, geom in enumerate(geom_series):
-                if geom is None or geom.is_empty:
-                    continue
-                valid_positions.append(pos)
-                valid_coords.append((geom.x, geom.y))
-
-            if len(valid_coords) > 0:
-                for pos, sample in zip(valid_positions, src.sample(valid_coords, indexes=band_index)):
-                    sampled_values[pos] = float(sample[0])
-
-            if src.nodata is not None:
-                sampled_values[sampled_values == src.nodata] = np.nan
-
-    # Apply the calculated values to the cost_source column
-    sampled_series = pd.Series(sampled_values, index=out.index)
-    if overwrite:
-        mask = sampled_series.notna()
-    else:
-        mask = out['cost_source'].isna() & sampled_series.notna()
-
-    out.loc[mask, 'cost_source'] = sampled_series.loc[mask]
-    
-    return out
-
-def redistribute_small_national_shares(nat_shares_df, min_share_pct=1.0):
-    """
-    Remove shares below a threshold and re-normalize to 100%.
-    Preserves the original index and emits a sanity warning if needed.
-    """
-    if nat_shares_df.shape[1] == 0:
-        raise ValueError("nat_shares_df has no numeric column")
-
-    out = nat_shares_df.copy()
-    share_col = out.columns[0]
-
-    # Convert to numeric, handle missing values
-    shares = pd.to_numeric(out[share_col], errors='coerce').fillna(0.0)
-
-    # Identify which shares to keep
-    keep = shares >= float(min_share_pct)
-
-    # Set dropped shares to 0
-    redistributed = shares.where(keep, 0.0)
-    total_keep = float(redistributed.sum())
-
-    # Redistribute proportionally to reach 100%
-    redistributed = redistributed * (100.0 / total_keep)
-    out[share_col] = redistributed
-    
-    return out
-
-def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1, mask_layer=None):
+def refineries(gdf, default_gdf, fob_per_kg):
     """
     Fill missing values and add LPG price from raster sampling.
     Ensures crude capacity is numeric and non-null.
@@ -208,7 +97,11 @@ def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1, mask_layer
         else:
             gdf['crude_capacity'] = pd.to_numeric(gdf['crude_capacity'], errors='coerce').fillna(0.0)
 
-        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        # Phase 3: complete cost_source with fob_per_kg if still missing
+        if 'cost_source' not in gdf.columns:
+            gdf['cost_source'] = float(fob_per_kg)
+        else:
+            gdf['cost_source'] = gdf['cost_source'].fillna(float(fob_per_kg))
 
         missing_prices = int(gdf['cost_source'].isna().sum())
         if missing_prices > 0:
@@ -216,7 +109,7 @@ def refineries(gdf, default_gdf, lpg_price_raster_path, price_band=1, mask_layer
     return gdf
 
 
-def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1, mask_layer=None):
+def gas_plants(gdf, default_gdf, fob_per_kg):
     """
     Fill missing values and add LPG price from raster sampling.
     Normalizes LPG production to numeric values.
@@ -236,7 +129,11 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1, mask_
         else:
             gdf['LPG_prod'] = pd.to_numeric(gdf['LPG_prod'], errors='coerce').fillna(0.0)
 
-        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        # Phase 3: complete cost_source with fob_per_kg if still missing
+        if 'cost_source' not in gdf.columns:
+            gdf['cost_source'] = float(fob_per_kg)
+        else:
+            gdf['cost_source'] = gdf['cost_source'].fillna(float(fob_per_kg))
 
         missing_prices = int(gdf['cost_source'].isna().sum())
         if missing_prices > 0:
@@ -245,16 +142,13 @@ def gas_plants(gdf, default_gdf, lpg_price_raster_path=None, price_band=1, mask_
     return gdf
 
 
-def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = None, price_band=1, use_historic_data = False, historic_data_col = None, mask_layer=None):
+def ports(gdf, default_gdf = None, storage_gdf = None, fob_per_kg = None, use_historic_data = False, historic_data_col = None, mask_layer=None):
     """
     Handles data cleaning, spatial linking with storage facilities, 
     and sampling the base LPG price from the raster.
     """
     if not gdf.empty:
         gdf = gdf.copy()
-
-        if lpg_price_raster_path is None and default_gdf is None:
-            raise ValueError("lpg_price_raster_path and default_gdf are required for ports when only_phase4=False")
 
         # Phase 1: Fill missing values from buffer
         fill_cols = ['VLGC_compliance', 'cost_source', 'LPG_export_2023', 'LPG_import_2023', 'LPG_export_2024', 'LPG_import_2024', 'LPG_export_2025', 'LPG_import_2025', 'source_price_2023_imp', 'source_price_2023_exp', 'source_price_2024_imp', 'source_price_2024_exp', 'source_price_2025_imp', 'source_price_2025_exp', 'percentage_CITAC']
@@ -268,9 +162,10 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
 
         # Phase 2: Ensure cost_source exists and sample from raster
         if 'cost_source' not in gdf.columns:
-            gdf['cost_source'] = np.nan
-        gdf = fill_lpg_price_from_raster(gdf, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
-
+            gdf['cost_source'] = float(fob_per_kg)
+        else:
+            gdf['cost_source'] = gdf['cost_source'].fillna(float(fob_per_kg))
+        
         # Phase 3: Initialize spatial and technical fields
         gdf['LPG_capacity'] = 0.0
         gdf['tanks_nearby'] = 0.0
@@ -329,7 +224,7 @@ def ports(gdf, default_gdf = None, storage_gdf = None, lpg_price_raster_path = N
     return gdf
 
 
-def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
+def primary_storage(gdf, default_gdf):
     """
     Ensure storage capacity fields exist and are numeric.
     Fills LPG_capacity from nearby defaults when missing.
@@ -354,7 +249,7 @@ def primary_storage(gdf, default_gdf, lpg_price_raster_path, price_band=1):
     return gdf
 
 
-def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, country, price_band=1, mask_layer=None):
+def border_points(gdf, default_gdf, fob_per_kg, nat_shares_df, country, mask_layer=None):
     """
     Handles data initialization, spatial filling, raster sampling, 
     and supply share allocation for border points.
@@ -378,7 +273,10 @@ def border_points(gdf, default_gdf, nat_shares_df, lpg_price_raster_path, countr
 
         # Phase 2: Fill from buffer and raster
         bp = fill_from_buffer(bp, default_gdf, ['cost_source', 'osbp', 'border_ferry'])
-        bp = fill_lpg_price_from_raster(bp, lpg_price_raster_path, band_index=price_band, overwrite=False, mask_layer=mask_layer)
+        if 'cost_source' not in gdf.columns:
+            gdf['cost_source'] = float(fob_per_kg)
+        else:
+            gdf['cost_source'] = gdf['cost_source'].fillna(float(fob_per_kg))
 
         bp['osbp'] = bp['osbp'].replace('', np.nan).fillna('no')
         bp['border_ferry'] = bp['border_ferry'].replace('', np.nan).fillna('no')

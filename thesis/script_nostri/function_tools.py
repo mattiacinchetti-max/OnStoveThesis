@@ -54,57 +54,17 @@ def _as_vector_layer(gdf, name="mask"):
     vect.data = gdf.copy()
     return vect
 
-def load_raster_means(raster_path, band_names, mask_gdf):
-    """
-    Clip each band by mask and compute mean values.
-    Returns a single-column DataFrame indexed by band names.
-    Raises if any band has no valid pixels inside the mask.
-    """
-    if not raster_path.exists():
-        raise FileNotFoundError(f"Missing raster file: {raster_path}")
-
-    if mask_gdf.crs is None:
-        raise ValueError("mask_layer has no CRS")
-
-    mask_vect = _as_vector_layer(mask_gdf, name="mask_layer")
-    values = {}
-
-    for band_idx, band_name in enumerate(band_names, start=1):
-        raster = RasterLayer(name=f"{raster_path.stem}_{band_name}", path=str(raster_path), band=band_idx)
-        raster.mask(mask_vect, crop=True, all_touched=False)
-
-        arr = raster.data.astype(np.float64)
-        nodata = raster.meta.get('nodata')
-        if nodata is not None:
-            if pd.notna(nodata):
-                arr[arr == nodata] = np.nan
-
-        mean_val = np.nanmean(arr)
-        if np.isnan(mean_val):
-            raise ValueError(
-                f"Band '{band_name}' in {raster_path.name} has no valid data inside mask_layer"
-            )
-        values[band_name] = float(mean_val)
-
-    result = pd.DataFrame.from_dict(values, orient='index')
-    result.columns = [1]
-    return result
-
-import geopandas as gpd
-from shapely.ops import nearest_points
-
-def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5, inward_shift_m=500):
+def load_or_use_default(user_gpkg_path, user_layer_name, default_gpkg_path, default_layer_name, mask_gdf, data_dir, near_km=5, inward_shift_m=500):
     """
     Load a layer from user data or defaults. Keep geometries within mask_gdf,
     snap points within near_km to a buffered inner boundary (inward_shift_m), and drop the rest.
     Returns a GeoDataFrame with a stable "id_supply" column.
     """
-    gpkg_path = data_dir / f"{gpkg_name}.gpkg"
 
     # Phase 1 & 2: Data Loading
-    if gpkg_path.exists():
-        gdf = gpd.read_file(gpkg_path)
-        source_name = f"{gpkg_path.name}"
+    if user_gpkg_path.exists():
+        gdf = gpd.read_file(user_gpkg_path, layer = user_layer_name)
+        source_name = f"{user_gpkg_path.name}"
     else:
         if not default_gpkg_path.exists():
             raise FileNotFoundError(f"Missing default gpkg: {default_gpkg_path}")
@@ -112,16 +72,16 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
         source_name = f"{default_gpkg_path.name}/{default_layer_name}"
 
     if gdf.empty:
-        print(f"{gpkg_name}: loaded 0 records from {source_name}")
+        print(f"{user_gpkg_path.name}: loaded 0 records from {source_name}")
         gdf = gdf.reset_index(drop=True)
-        gdf['id_supply'] = f"{gpkg_name}_" + gdf.index.astype(str)
+        gdf['id_supply'] = f"{user_gpkg_path.name}_" + gdf.index.astype(str)
         return gdf
 
     # CRS Validation
     if mask_gdf.crs is None:
         raise ValueError("mask_gdf has no CRS")
     if gdf.crs is None:
-        raise ValueError(f"{gpkg_name} has no CRS")
+        raise ValueError(f"{user_gpkg_path.name} has no CRS")
 
     # Projection for Metric Distance Calculations
     original_crs = mask_gdf.crs
@@ -172,9 +132,9 @@ def load_or_use_default(gpkg_name, default_gpkg_path, default_layer_name, mask_g
         out = out_m.to_crs(original_crs)
 
     out = out.reset_index(drop=True)
-    out['id_supply'] = f"{gpkg_name}_" + out.index.astype(str)
+    out['id_supply'] = f"{user_gpkg_path.name}_" + out.index.astype(str)
     
-    print(f"{gpkg_name}: loaded from {source_name} | inside={inside_count}, moved_inside_mask={moved_count}, dropped_far={dropped_count}")
+    print(f"{user_gpkg_path.name}: loaded from {source_name} | inside={inside_count}, moved_inside_mask={moved_count}, dropped_far={dropped_count}")
     
     return out
 
@@ -554,3 +514,4 @@ def stack_huff_rasters(
                                       "best_reseller_id_car", "best_time_car_min", 
                                       "best_distance_car_km"], 1):
                 dst.set_band_description(i, name)
+
